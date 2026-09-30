@@ -222,6 +222,12 @@ class Pkg(BaseModel):
 
 # ---------- status / meta ----------
 
+@app.get("/api/health")
+async def health():
+    """Unauthenticated identity check so the launcher can tell this app from anything else on the port."""
+    return {"app": "apk-loader", "version": __version__}
+
+
 @app.get("/api/status", dependencies=[Depends(auth)])
 async def status():
     s = await adb.status()

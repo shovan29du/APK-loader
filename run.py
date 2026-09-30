@@ -4,14 +4,59 @@
     python run.py --hardware         show detected hardware and the tuned settings
     python run.py --setup-emulator   download Java + Android SDK + emulator + bundletool
 """
+import json
 import os
+import socket
 import sys
 import threading
 import time
+import urllib.request
 import webbrowser
 
 HOST = os.getenv("APKLOADER_HOST", "127.0.0.1")
 PORT = int(os.getenv("APKLOADER_PORT", "8000"))
+
+
+def port_in_use(host: str, port: int) -> bool:
+    """True if anything already answers on the port (also catches programs bound to 0.0.0.0)."""
+    with socket.socket() as s:
+        s.settimeout(0.5)
+        return s.connect_ex((host, port)) == 0
+
+
+def can_bind(host: str, port: int) -> bool:
+    with socket.socket() as s:
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):   # Windows would otherwise let two programs share a port
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        try:
+            s.bind((host, port))
+            return True
+        except OSError:
+            return False
+
+
+def pick_port(host: str, preferred: int) -> int:
+    for port in range(preferred, preferred + 30):
+        if not port_in_use(host, port) and can_bind(host, port):
+            return port
+    raise SystemExit(f"No free port found between {preferred} and {preferred + 29}. "
+                     "Set APKLOADER_PORT to a free port.")
+
+
+def open_when_ready(host: str, port: int):
+    """Open the browser only once /api/health proves this really is APK Loader."""
+    url = f"http://{host}:{port}"
+    for _ in range(120):
+        try:
+            with urllib.request.urlopen(url + "/api/health", timeout=1) as r:
+                if json.load(r).get("app") == "apk-loader":
+                    print(f"APK Loader is running at {url}", flush=True)
+                    webbrowser.open(url)
+                    return
+        except Exception:
+            pass
+        time.sleep(0.5)
+    print(f"APK Loader did not answer at {url}", flush=True)
 
 
 def main():
@@ -46,11 +91,13 @@ def main():
         if d.is_dir():
             os.environ["PATH"] = str(d) + os.pathsep + os.environ.get("PATH", "")
             break
-    threading.Thread(target=lambda: (time.sleep(1.5), webbrowser.open(f"http://{HOST}:{PORT}")),
-                     daemon=True).start()
+    port = pick_port(HOST, PORT)
+    if port != PORT:
+        print(f"Port {PORT} is already in use by another program; using {port} instead.", flush=True)
+    threading.Thread(target=open_when_ready, args=(HOST, port), daemon=True).start()
     import uvicorn
     from app.main import app
-    uvicorn.run(app, host=HOST, port=PORT, log_level="info",
+    uvicorn.run(app, host=HOST, port=port, log_level="info",
                 log_config=None if getattr(sys, "frozen", False) else uvicorn.config.LOGGING_CONFIG)
 
 
