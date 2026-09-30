@@ -170,3 +170,12 @@ def test_remote_path_restricted():
 def test_package_validation():
     assert adb.valid_package("com.example.app")
     assert not adb.valid_package("com.x; rm -rf /")
+
+
+def test_hardware_profile_for_target_laptop():
+    from app import hardware
+    r = hardware.recommend({"ram_mb": 16000, "threads": 12, "nvidia": "NVIDIA GeForce RTX 5050 Laptop GPU"})
+    assert r["emu_ram_mb"] == 4096 and r["emu_cores"] == 6 and r["emu_gpu"] == "host"
+    assert r["video_max"] == 1920
+    low = hardware.recommend({"ram_mb": 4000, "threads": 4, "nvidia": ""})
+    assert low["emu_gpu"] == "swiftshader_indirect" and low["emu_ram_mb"] == 2048

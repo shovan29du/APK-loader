@@ -218,6 +218,7 @@ def setup_emulator(dest: Path):
     if (dest / "android-sdk" / "emulator").exists():
         return say("Android emulator already set up.")
     say("Setting up the Android emulator (Java, SDK, system image, bundletool)…")
+    subprocess.run([str(venv_python(dest)), str(dest / "run.py"), "--hardware"], cwd=dest)
     r = subprocess.run([str(venv_python(dest)), str(dest / "run.py"), "--setup-emulator"], cwd=dest)
     if r.returncode != 0:
         say("Emulator setup failed. The app still works with your own adb device; "

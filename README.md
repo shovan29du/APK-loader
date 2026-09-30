@@ -22,6 +22,15 @@ Packaged builds set the emulator up from **Device → Set up / repair**.
 
 The emulator needs hardware virtualization (KVM on Linux, Hyper-V/WHPX on Windows; built in on macOS).
 
+## Hardware tuning (automatic)
+The app detects RAM, CPU threads and an NVIDIA GPU and tunes itself (`python run.py --hardware` shows the result).
+For a 16 GB / 8+ thread / RTX laptop: emulator gets 4 GB RAM, up to 6 cores and `-gpu host` (the RTX; on Windows the
+installer also sets the "high performance" graphics preference for the emulator), a 16 GB data partition,
+quick-boot snapshots (resume in seconds from the SSD), and a 1920 px / 12 Mbps video stream.
+Override with `EMU_RAM_MB`, `EMU_CORES`, `EMU_GPU`, `VIDEO_MAX`, `VIDEO_BITRATE`.
+Keep your NVIDIA driver up to date (RTX 50-series needs a recent one). On Windows, enable *Windows Hypervisor Platform*
+and BIOS virtualization (setup prints the exact command if acceleration is missing).
+
 ## Automatic behaviour
 - Boots the bundled emulator when no device answers on adb.
 - Checks installed marketplace apps and APK Loader itself for updates every 6 h (Updates tab, banner).

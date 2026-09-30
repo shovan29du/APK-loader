@@ -12,7 +12,7 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
-from . import config
+from . import config, hardware
 from .util import safe_extract_zip
 
 SDK = config.DATA_DIR / "android-sdk"
@@ -93,6 +93,9 @@ def env() -> dict:
     if j:
         e["JAVA_HOME"] = str(Path(j).parent.parent)
     e["ANDROID_SDK_ROOT"] = e["ANDROID_HOME"] = str(SDK)
+    if sys.platform.startswith("linux") and hardware.nvidia_gpu():
+        e.setdefault("__NV_PRIME_RENDER_OFFLOAD", "1")      # hybrid laptop: use the RTX, not the iGPU
+        e.setdefault("__GLX_VENDOR_LIBRARY_NAME", "nvidia")
     return e
 
 
@@ -116,6 +119,58 @@ def sdk_adb() -> Path:
 
 def installed() -> bool:
     return emulator_bin().exists() and (Path.home() / ".android/avd" / f"{AVD_NAME}.avd").exists()
+
+
+def tune_avd(log=print):
+    """Write performance settings for this machine into the AVD's config.ini."""
+    cfg = Path.home() / ".android/avd" / f"{AVD_NAME}.avd" / "config.ini"
+    if not cfg.exists():
+        return
+    r = hardware.recommend()
+    want = {"hw.ramSize": r["emu_ram_mb"], "hw.cpu.ncore": r["emu_cores"],
+            "vm.heapSize": r["emu_heap_mb"], "disk.dataPartition.size": f"{r['emu_data_mb']}M",
+            "hw.gpu.enabled": "yes", "hw.gpu.mode": r["emu_gpu"],
+            "hw.audioInput": "no", "hw.audioOutput": "no", "showDeviceFrame": "no",
+            "fastboot.forceColdBoot": "no", "fastboot.forceFastBoot": "yes"}
+    lines = [l for l in cfg.read_text().splitlines()
+             if l.split("=", 1)[0].strip() not in want]
+    lines += [f"{k}={v}" for k, v in want.items()]
+    cfg.write_text("\n".join(lines) + "\n")
+    log(f"AVD tuned: {r['emu_ram_mb']} MB RAM, {r['emu_cores']} cores, gpu={r['emu_gpu']}")
+
+
+def prefer_dgpu(log=print):
+    """Windows hybrid laptops: make Windows run the emulator on the NVIDIA GPU, not the iGPU."""
+    if not WIN or not hardware.nvidia_gpu():
+        return
+    try:
+        import winreg
+        key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\DirectX\UserGpuPreferences")
+        for exe in [emulator_bin(), *(SDK / "emulator").glob("qemu/windows-*/qemu-system-*.exe")]:
+            winreg.SetValueEx(key, str(exe), 0, winreg.REG_SZ, "GpuPreference=2;")
+        log("Windows graphics preference: emulator -> high performance (NVIDIA)")
+    except Exception as e:
+        log(f"Could not set GPU preference ({e}); set it in Settings > System > Display > Graphics")
+
+
+def accel_status() -> tuple[bool, str]:
+    """Is hardware virtualization usable? (emulator -accel-check)"""
+    if not emulator_bin().exists():
+        return False, "emulator not installed"
+    try:
+        p = subprocess.run([str(emulator_bin()), "-accel-check"], capture_output=True,
+                           text=True, env=env(), timeout=60)
+        out = (p.stdout + p.stderr).strip()
+        if p.returncode == 0:  # -accel-check exits 0 only when acceleration is usable
+            return True, out.splitlines()[-1] if out else "ok"
+    except Exception as e:
+        out = str(e)
+    hint = ("Enable 'Windows Hypervisor Platform' (admin PowerShell: "
+            "Enable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform -All) and reboot; "
+            "also enable Intel VT-x/virtualization in BIOS." if WIN else
+            "Enable Intel VT-x in BIOS and make sure /dev/kvm is usable (add your user to the 'kvm' group)." if OS_TAG == "linux"
+            else "Hypervisor.framework should be available; update macOS.")
+    return False, f"hardware acceleration unavailable: {out[:200]} — {hint}"
 
 
 def _run(cmd, input_text=None):
@@ -148,6 +203,10 @@ def setup(log=print, with_bundletool: bool = True):
           f"build-tools;{API_LEVEL}.0.0", image])
     log("Creating virtual device…")
     _run([avdmanager(), "create", "avd", "-n", AVD_NAME, "-k", image, "-d", "pixel_5", "--force"], "no\n")
+    tune_avd(log)
+    prefer_dgpu(log)
+    ok, msg = accel_status()
+    log(("Hardware acceleration OK: " if ok else "WARNING: ") + msg)
     if with_bundletool:
         tools = config.DATA_DIR / "tools"
         tools.mkdir(exist_ok=True)
@@ -170,15 +229,26 @@ class Controller:
             return
         if not installed():
             raise RuntimeError("emulator is not installed (run full_install.py, or use Set up emulator)")
+        tune_avd(lambda m: None)
+        prefer_dgpu(lambda m: None)
+        gpu = hardware.recommend()["emu_gpu"]
+        # Quick-boot snapshots stay enabled: after the first run the emulator resumes in seconds from the SSD.
         self.proc = subprocess.Popen(
             [str(emulator_bin()), "-avd", AVD_NAME, "-port", "5554", "-no-window", "-no-audio",
-             "-no-snapshot-save", "-no-boot-anim", "-gpu", "auto"],
+             "-no-boot-anim", "-gpu", gpu],
             env=env(), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         config.ADB_SERIAL = SERIAL
         if sdk_adb().exists():
             config.ADB_BIN = str(sdk_adb())
 
     def stop(self):
+        if self.running():
+            try:  # graceful kill lets the emulator save its quick-boot snapshot
+                subprocess.run([config.ADB_BIN, "-s", SERIAL, "emu", "kill"], timeout=20,
+                               capture_output=True)
+                self.proc.wait(30)
+            except Exception:
+                pass
         if self.running():
             self.proc.terminate()
             try:

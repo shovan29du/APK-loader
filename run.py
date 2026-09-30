@@ -1,6 +1,7 @@
 """Start APK Loader and open it in the browser.
 
     python run.py                    run the server (auto-starts the emulator if installed)
+    python run.py --hardware         show detected hardware and the tuned settings
     python run.py --setup-emulator   download Java + Android SDK + emulator + bundletool
 """
 import os
@@ -20,6 +21,10 @@ def main():
         sys.path.insert(0, here)
     from app import config, emulator
 
+    if "--hardware" in sys.argv:
+        from app import hardware
+        print(hardware.describe())
+        return
     if "--setup-emulator" in sys.argv:
         emulator.setup(lambda m: print("==>", m, flush=True))
         return

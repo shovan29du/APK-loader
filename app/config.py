@@ -31,8 +31,10 @@ DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", DATA_DIR / "downloads")).resolve()
 MAX_APK_MB = int(os.getenv("MAX_APK_MB", "500"))
 API_TOKEN = os.getenv("API_TOKEN", "")
 STREAM_FPS = float(os.getenv("STREAM_FPS", "4"))          # screenshot fallback
-VIDEO_MAX = int(os.getenv("VIDEO_MAX", "1280"))           # longest side of H.264 stream
-VIDEO_BITRATE = int(os.getenv("VIDEO_BITRATE", "4000000"))
+from . import hardware  # noqa: E402  (tunes stream quality to the host)
+_rec = hardware.recommend()
+VIDEO_MAX = _rec["video_max"]             # longest side of the H.264 stream
+VIDEO_BITRATE = _rec["video_bitrate"]
 # Optional VirusTotal hash lookup (only the SHA-256 is sent).
 VT_API_KEY = os.getenv("VT_API_KEY", "")
 # Admins with an internal repo can disable the SSRF guard.
