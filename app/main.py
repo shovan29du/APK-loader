@@ -1,24 +1,78 @@
 import asyncio
 import json
+import logging
 import shutil
+import time
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
 from fastapi import (Depends, FastAPI, File, Form, HTTPException, Request,
                      UploadFile, WebSocket, WebSocketDisconnect)
 from fastapi.responses import FileResponse
-from starlette.background import BackgroundTask
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from starlette.background import BackgroundTask
 
-from . import adb, config
-from .providers import PROVIDERS, check_public_url, safe_filename
+from . import __version__, adb, config, emulator, installer, plugins, registry, safety, updates, video
+from .jobs import manager
+from .providers import ARCHIVE_EXTS, PROVIDERS, check_public_url, safe_filename
 
-app = FastAPI(title="APK Loader")
-config.DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-STATIC = Path(__file__).resolve().parent.parent / "static"
+log = logging.getLogger("apkloader")
+STATIC = config.APP_DIR / "static"
 MAX_BYTES = config.MAX_APK_MB * 1024 * 1024
+KEEP_DAYS = 7  # stored APK files older than this are purged automatically
+state = {"updates": [], "checked": 0, "emulator_msg": ""}
+
+
+# ---------- automation: emulator, update checks, cleanup ----------
+
+def purge_old_downloads():
+    cutoff = time.time() - KEEP_DAYS * 86400
+    for d in config.DOWNLOAD_DIR.iterdir():
+        if d.is_dir() and d.stat().st_mtime < cutoff:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+async def ensure_device():
+    """If nothing answers on adb, boot the bundled emulator (when installed)."""
+    if (await adb.status())["connected"] or not config.AUTO_EMULATOR or not emulator.installed():
+        return
+    state["emulator_msg"] = "starting emulator…"
+    try:
+        await asyncio.to_thread(emulator.controller.start)
+        await emulator.wait_boot()
+        state["emulator_msg"] = ""
+    except Exception as e:
+        state["emulator_msg"] = f"emulator failed: {e}"
+
+
+async def background_loop():
+    while True:
+        try:
+            purge_old_downloads()
+            if (await adb.status())["connected"]:
+                state["updates"] = await updates.app_updates()
+                state["checked"] = time.time()
+            await updates.self_update(force=True)
+        except Exception as e:
+            log.warning("background check failed: %s", e)
+        await asyncio.sleep(6 * 3600)
+
+
+@asynccontextmanager
+async def lifespan(app):
+    config.DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    plugins.load_plugins()
+    tasks = [asyncio.create_task(ensure_device()), asyncio.create_task(background_loop())]
+    yield
+    for t in tasks:
+        t.cancel()
+    await asyncio.to_thread(emulator.controller.stop)
+
+
+app = FastAPI(title="APK Loader", version=__version__, lifespan=lifespan)
 
 
 async def auth(request: Request):
@@ -28,7 +82,7 @@ async def auth(request: Request):
 
 # ---------- helpers ----------
 
-async def download(url: str, dest: Path) -> None:
+async def download(url: str, dest: Path, on_progress=None) -> None:
     async with httpx.AsyncClient(follow_redirects=False, timeout=None,
                                  headers={"User-Agent": "apk-loader/1.0"}) as c:
         for _ in range(5):  # manual redirects so each hop is SSRF-checked
@@ -38,6 +92,7 @@ async def download(url: str, dest: Path) -> None:
                     url = str(r.url.join(r.headers["location"]))
                     continue
                 r.raise_for_status()
+                total = int(r.headers.get("content-length") or 0)
                 size = 0
                 with dest.open("wb") as f:
                     async for chunk in r.aiter_bytes(1 << 16):
@@ -45,29 +100,34 @@ async def download(url: str, dest: Path) -> None:
                         if size > MAX_BYTES:
                             raise ValueError(f"file exceeds {config.MAX_APK_MB} MB")
                         f.write(chunk)
+                        if on_progress and total:
+                            on_progress(size / total)
                 return
         raise ValueError("too many redirects")
 
 
-async def install_files(paths: list[Path], split: bool, hint: str = "") -> dict:
-    before = await adb.third_party_packages()
-    if split and len(paths) > 1:
-        await adb.install_multiple([str(p) for p in paths])
-    else:
-        for p in paths:
-            await adb.install(str(p))
-    new = sorted((await adb.third_party_packages()) - before)
-    package = new[0] if new else hint
-    return {"installed": True, "package": package}
-
-
 def scratch_dir() -> Path:
     d = config.DOWNLOAD_DIR / uuid.uuid4().hex
-    d.mkdir()
+    d.mkdir(parents=True)
     return d
 
 
-# ---------- API ----------
+async def _launch_last(job, run: bool):
+    if not run:
+        return
+    ok = [r for r in job.results if r.get("ok") and r.get("package")]
+    if ok:
+        try:
+            await adb.launch(ok[-1]["package"])
+        except adb.AdbError as e:
+            ok[-1]["launch_error"] = str(e)
+
+
+def _fail(job, label, e):
+    job.results.append({"label": label, "ok": False, "error": str(e)})
+
+
+# ---------- models ----------
 
 class Item(BaseModel):
     provider: str = "direct"
@@ -77,20 +137,32 @@ class Item(BaseModel):
 class BatchReq(BaseModel):
     items: list[Item]
     run_last: bool = False
+    allow_unsafe: bool = False
 
 
 class Pkg(BaseModel):
     package: str
 
 
+# ---------- status / meta ----------
+
 @app.get("/api/status", dependencies=[Depends(auth)])
 async def status():
-    return await adb.status()
+    s = await adb.status()
+    s["emulator"] = {"installed": emulator.installed(), "running": emulator.controller.running(),
+                     "message": state["emulator_msg"]}
+    s["version"] = __version__
+    return s
 
 
 @app.get("/api/providers", dependencies=[Depends(auth)])
 async def providers():
     return [n for n in PROVIDERS if n != "direct"] + ["direct"]
+
+
+@app.get("/api/version", dependencies=[Depends(auth)])
+async def version():
+    return await updates.self_update()
 
 
 @app.get("/api/search", dependencies=[Depends(auth)])
@@ -101,88 +173,145 @@ async def search(q: str, provider: str = "fdroid"):
     async with httpx.AsyncClient(headers={"User-Agent": "apk-loader/1.0"}, timeout=30) as c:
         try:
             return [a.dict() for a in await p.search(c, q)]
-        except httpx.HTTPError as e:
+        except (httpx.HTTPError, ValueError) as e:
             raise HTTPException(502, f"{provider} error: {e}")
 
 
-async def _install_item(item: Item) -> dict:
-    p = PROVIDERS.get(item.provider)
-    if not p:
-        raise ValueError("unknown provider")
-    async with httpx.AsyncClient(headers={"User-Agent": "apk-loader/1.0"}, timeout=30) as c:
-        url, hint = await p.resolve(c, item.id)
-    d = scratch_dir()
-    dest = d / safe_filename((hint or item.id.rsplit("/", 1)[-1]) + ".apk")
-    await download(url, dest)
-    return await install_files([dest], split=False, hint=hint)
+# ---------- jobs ----------
+
+@app.get("/api/jobs", dependencies=[Depends(auth)])
+async def jobs():
+    return [j.dict() for j in sorted(manager.jobs.values(), key=lambda j: -j.created)]
+
+
+@app.get("/api/jobs/{job_id}", dependencies=[Depends(auth)])
+async def job(job_id: str):
+    j = manager.jobs.get(job_id)
+    if not j:
+        raise HTTPException(404, "no such job")
+    return j.dict()
+
+
+def _install_job(items: list[Item], run_last: bool, allow_unsafe: bool):
+    async def work(job):
+        n = len(items)
+        for i, item in enumerate(items):
+            base = i / n
+            span = 1 / n
+            label = item.id
+            try:
+                prov = PROVIDERS.get(item.provider)
+                if not prov:
+                    raise ValueError("unknown provider")
+                job.message = f"Resolving {label}…"
+                async with httpx.AsyncClient(headers={"User-Agent": "apk-loader/1.0"}, timeout=30) as c:
+                    meta = await prov.resolve(c, item.id)
+                dest = scratch_dir() / safe_filename((meta.package or item.id.rsplit("/", 1)[-1]) + meta.ext)
+                job.message = f"Downloading {label}…"
+
+                def prog(f, base=base, span=span):
+                    job.progress = base + span * 0.6 * f
+                await download(meta.url, dest, prog)
+                job.progress = base + span * 0.7
+                job.message = f"Checking and installing {label}…"
+                res = await installer.verify_and_install(dest, meta, allow_unsafe, item.provider, item.id)
+                job.results.append({"label": label, **res})
+            except Exception as e:
+                _fail(job, label, e)
+            job.progress = (i + 1) / n
+        await _launch_last(job, run_last)
+        job.message = ""
+    return work
 
 
 @app.post("/api/install", dependencies=[Depends(auth)])
 async def install_batch(req: BatchReq):
-    """Download + install one or many apps. Each item reports its own result."""
+    """Download + install one or many apps in the background. Poll /api/jobs/{id}."""
     if not req.items:
         raise HTTPException(400, "no items")
-    results = []
-    for item in req.items:
-        try:
-            res = await _install_item(item)
-            results.append({"id": item.id, "ok": True, **res})
-        except Exception as e:  # keep going: one failure must not block the rest
-            results.append({"id": item.id, "ok": False, "error": str(e)})
-    if req.run_last:
-        ok = [r for r in results if r["ok"] and r.get("package")]
-        if ok:
-            try:
-                await adb.launch(ok[-1]["package"])
-            except adb.AdbError as e:
-                ok[-1]["launch_error"] = str(e)
-    return {"results": results}
+    j = manager.start("install", f"Install {len(req.items)} app(s)",
+                      _install_job(req.items, req.run_last, req.allow_unsafe))
+    return {"job": j.id}
 
 
 @app.post("/api/upload", dependencies=[Depends(auth)])
 async def upload(files: list[UploadFile] = File(...), split: bool = Form(False),
-                 run: bool = Form(False)):
-    """Install one or many uploaded APKs.
+                 run: bool = Form(False), allow_unsafe: bool = Form(False)):
+    """Install uploaded .apk/.xapk/.apks/.aab files.
 
-    split=false: each file is a separate app.  split=true: all files are the
-    split APKs of a single app (installed together with install-multiple).
+    split=false: each file is its own app.  split=true: the .apk files are the
+    split APKs of a single app (installed together).
     """
     d = scratch_dir()
     saved: list[Path] = []
     for i, f in enumerate(files):
-        if not (f.filename or "").lower().endswith(".apk"):
-            raise HTTPException(400, f"{f.filename}: only .apk files are accepted")
-        dest = d / f"{i}_{safe_filename(f.filename)}"
+        name = f.filename or ""
+        if not name.lower().endswith(ARCHIVE_EXTS):
+            shutil.rmtree(d, ignore_errors=True)
+            raise HTTPException(400, f"{name}: only {', '.join(ARCHIVE_EXTS)} files are accepted")
+        dest = d / f"{i}_{safe_filename(name)}"
         size = 0
         with dest.open("wb") as out:
             while chunk := await f.read(1 << 16):
                 size += len(chunk)
                 if size > MAX_BYTES:
-                    raise HTTPException(413, f"{f.filename} exceeds {config.MAX_APK_MB} MB")
+                    shutil.rmtree(d, ignore_errors=True)
+                    raise HTTPException(413, f"{name} exceeds {config.MAX_APK_MB} MB")
                 out.write(chunk)
         saved.append(dest)
+    if split and not all(p.suffix.lower() == ".apk" for p in saved):
+        raise HTTPException(400, "split mode only takes .apk files")
 
-    results = []
-    groups = [saved] if split else [[p] for p in saved]
-    for g in groups:
-        label = ", ".join(p.name.split("_", 1)[1] for p in g)
-        try:
-            results.append({"file": label, "ok": True, **await install_files(g, split)})
-        except adb.AdbError as e:
-            results.append({"file": label, "ok": False, "error": str(e)})
-    if run:
-        ok = [r for r in results if r["ok"] and r.get("package")]
-        if ok:
+    async def work(job):
+        groups = [saved] if split else [[p] for p in saved]
+        for gi, g in enumerate(groups):
+            label = ", ".join(p.name.split("_", 1)[1] for p in g)
+            job.message = f"Installing {label}…"
             try:
-                await adb.launch(ok[-1]["package"])
-            except adb.AdbError as e:
-                ok[-1]["launch_error"] = str(e)
-    return {"results": results}
+                if len(g) > 1:
+                    reports = [await safety.verify(p) for p in g]
+                    blocked = [r for r in reports if r.blocked]
+                    if blocked and not allow_unsafe:
+                        raise adb.AdbError("blocked by safety checks")
+                    pkg = await installer.install_artifact(g[0], split_group=g)
+                    res = {"ok": True, "package": pkg, "safety": reports[0].dict()}
+                else:
+                    res = await installer.verify_and_install(g[0], None, allow_unsafe)
+                job.results.append({"label": label, **res})
+            except Exception as e:
+                _fail(job, label, e)
+            job.progress = (gi + 1) / len(groups)
+        await _launch_last(job, run)
+        job.message = ""
 
+    j = manager.start("install", f"Install {len(saved)} file(s)", work)
+    return {"job": j.id}
+
+
+# ---------- installed apps ----------
 
 @app.get("/api/apps", dependencies=[Depends(auth)])
 async def installed_apps():
     return sorted(await adb.third_party_packages())
+
+
+@app.post("/api/launch", dependencies=[Depends(auth)])
+async def launch(p: Pkg):
+    try:
+        await adb.launch(p.package)
+    except adb.AdbError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True}
+
+
+@app.post("/api/uninstall", dependencies=[Depends(auth)])
+async def uninstall(p: Pkg):
+    try:
+        await adb.uninstall(p.package)
+    except adb.AdbError as e:
+        raise HTTPException(400, str(e))
+    registry.forget(p.package)
+    return {"ok": True}
 
 
 @app.get("/api/apps/{package}/apk", dependencies=[Depends(auth)])
@@ -203,11 +332,33 @@ async def copy_from_device(package: str):
     return FileResponse(archive, filename=f"{package}.zip", background=cleanup)
 
 
-# ---------- stored APK library (downloaded / uploaded files) ----------
+# ---------- updates ----------
+
+@app.get("/api/updates", dependencies=[Depends(auth)])
+async def get_updates(refresh: bool = False):
+    if refresh or not state["checked"]:
+        state["updates"] = await updates.app_updates()
+        state["checked"] = time.time()
+    return {"checked": state["checked"], "updates": state["updates"]}
+
+
+@app.post("/api/updates/apply", dependencies=[Depends(auth)])
+async def apply_updates(packages: list[str] | None = None):
+    """Update the given packages (or all with updates) via their original marketplace."""
+    todo = [u for u in state["updates"] if packages is None or u["package"] in packages]
+    if not todo:
+        raise HTTPException(400, "nothing to update")
+    items = [Item(provider=u["provider"], id=u["id"]) for u in todo]
+    j = manager.start("update", f"Update {len(items)} app(s)", _install_job(items, False, False))
+    state["updates"] = [u for u in state["updates"] if u not in todo]
+    return {"job": j.id}
+
+
+# ---------- stored APK library ----------
 
 def _lib_dir(apk_id: str) -> Path:
     d = (config.DOWNLOAD_DIR / apk_id).resolve()
-    if d.parent != config.DOWNLOAD_DIR or not d.is_dir():
+    if d.parent != config.DOWNLOAD_DIR.resolve() or not d.is_dir():
         raise HTTPException(404, "not found")
     return d
 
@@ -215,14 +366,15 @@ def _lib_dir(apk_id: str) -> Path:
 @app.get("/api/apks", dependencies=[Depends(auth)])
 async def list_apks():
     return [{"id": d.name, "files": [{"name": f.name, "size": f.stat().st_size}
-                                     for f in sorted(d.iterdir())]}
+                                     for f in sorted(d.iterdir()) if f.is_file()]}
             for d in sorted(config.DOWNLOAD_DIR.iterdir()) if d.is_dir()]
 
 
 @app.get("/api/apks/{apk_id}/{name}", dependencies=[Depends(auth)])
 async def get_apk(apk_id: str, name: str):
-    f = (_lib_dir(apk_id) / name).resolve()
-    if f.parent != _lib_dir(apk_id) or not f.is_file():
+    d = _lib_dir(apk_id)
+    f = (d / name).resolve()
+    if f.parent != d or not f.is_file():
         raise HTTPException(404, "not found")
     return FileResponse(f, filename=name)
 
@@ -233,25 +385,173 @@ async def delete_apk(apk_id: str):
     return {"ok": True}
 
 
-@app.post("/api/launch", dependencies=[Depends(auth)])
-async def launch(p: Pkg):
+# ---------- device controls: screenshot, rotate, files ----------
+
+@app.get("/api/screenshot", dependencies=[Depends(auth)])
+async def screenshot():
     try:
-        await adb.launch(p.package)
+        png = await adb.screenshot()
+    except adb.AdbError as e:
+        raise HTTPException(400, str(e))
+    d = scratch_dir()
+    f = d / f"screenshot-{time.strftime('%Y%m%d-%H%M%S')}.png"
+    f.write_bytes(png)
+    return FileResponse(f, filename=f.name, background=BackgroundTask(shutil.rmtree, d, ignore_errors=True))
+
+
+class Rot(BaseModel):
+    rotation: int
+
+
+@app.post("/api/rotate", dependencies=[Depends(auth)])
+async def rotate(r: Rot):
+    try:
+        await adb.rotate(r.rotation)
     except adb.AdbError as e:
         raise HTTPException(400, str(e))
     return {"ok": True}
 
 
-@app.post("/api/uninstall", dependencies=[Depends(auth)])
-async def uninstall(p: Pkg):
+@app.get("/api/files", dependencies=[Depends(auth)])
+async def files_list(path: str = "/sdcard"):
     try:
-        await adb.uninstall(p.package)
+        return {"path": adb.safe_remote(path), "items": await adb.list_dir(path)}
+    except adb.AdbError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.get("/api/files/download", dependencies=[Depends(auth)])
+async def files_download(path: str):
+    try:
+        remote = adb.safe_remote(path)
+        d = scratch_dir()
+        local = d / safe_filename(remote.rsplit("/", 1)[-1] or "file")
+        await adb.pull(remote, str(local))
+    except adb.AdbError as e:
+        raise HTTPException(400, str(e))
+    return FileResponse(local, filename=local.name,
+                        background=BackgroundTask(shutil.rmtree, d, ignore_errors=True))
+
+
+@app.post("/api/files/upload", dependencies=[Depends(auth)])
+async def files_upload(path: str = Form(...), file: UploadFile = File(...)):
+    d = scratch_dir()
+    try:
+        remote = adb.safe_remote(path.rstrip("/") + "/" + (file.filename or "upload"))
+        local = d / safe_filename(file.filename or "upload")
+        size = 0
+        with local.open("wb") as out:
+            while chunk := await file.read(1 << 20):
+                size += len(chunk)
+                if size > MAX_BYTES * 4:
+                    raise HTTPException(413, "file too large")
+                out.write(chunk)
+        await adb.push(str(local), remote)
+    except adb.AdbError as e:
+        raise HTTPException(400, str(e))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    return {"ok": True}
+
+
+@app.delete("/api/files", dependencies=[Depends(auth)])
+async def files_delete(path: str):
+    try:
+        await adb.remote_delete(path)
     except adb.AdbError as e:
         raise HTTPException(400, str(e))
     return {"ok": True}
 
 
-# ---------- live screen ----------
+# ---------- app data backups ----------
+
+def _backups() -> Path:
+    d = config.DATA_DIR / "backups"
+    d.mkdir(exist_ok=True)
+    return d
+
+
+@app.get("/api/backups", dependencies=[Depends(auth)])
+async def list_backups():
+    return [{"name": f.name, "size": f.stat().st_size, "mtime": f.stat().st_mtime}
+            for f in sorted(_backups().glob("*.tar"), reverse=True)]
+
+
+@app.post("/api/backups", dependencies=[Depends(auth)])
+async def create_backup(p: Pkg):
+    dest = _backups() / f"{p.package}-{time.strftime('%Y%m%d-%H%M%S')}.tar"
+    try:
+        await adb.backup_app(p.package, str(dest))
+    except adb.AdbError as e:
+        dest.unlink(missing_ok=True)
+        raise HTTPException(400, str(e))
+    return {"name": dest.name}
+
+
+def _backup_file(name: str) -> Path:
+    f = (_backups() / name).resolve()
+    if f.parent != _backups().resolve() or not f.is_file() or f.suffix != ".tar":
+        raise HTTPException(404, "not found")
+    return f
+
+
+@app.post("/api/backups/{name}/restore", dependencies=[Depends(auth)])
+async def restore_backup(name: str):
+    f = _backup_file(name)
+    package = f.name.rsplit("-", 2)[0]
+    try:
+        await adb.restore_app(package, str(f))
+    except adb.AdbError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True, "package": package}
+
+
+@app.get("/api/backups/{name}", dependencies=[Depends(auth)])
+async def download_backup(name: str):
+    f = _backup_file(name)
+    return FileResponse(f, filename=f.name)
+
+
+@app.delete("/api/backups/{name}", dependencies=[Depends(auth)])
+async def delete_backup(name: str):
+    _backup_file(name).unlink()
+    return {"ok": True}
+
+
+# ---------- emulator ----------
+
+@app.post("/api/emulator/start", dependencies=[Depends(auth)])
+async def emulator_start():
+    async def work(job):
+        job.message = "Booting emulator…"
+        await asyncio.to_thread(emulator.controller.start)
+        await emulator.wait_boot()
+        job.results.append({"ok": True, "label": "emulator"})
+        job.message = ""
+    return {"job": manager.start("emulator", "Start emulator", work, serial=False).id}
+
+
+@app.post("/api/emulator/stop", dependencies=[Depends(auth)])
+async def emulator_stop():
+    await asyncio.to_thread(emulator.controller.stop)
+    return {"ok": True}
+
+
+@app.post("/api/emulator/setup", dependencies=[Depends(auth)])
+async def emulator_setup():
+    """Download Java, the Android SDK, a system image and create the virtual device."""
+    async def work(job):
+        loop = asyncio.get_running_loop()
+
+        def log(msg):
+            loop.call_soon_threadsafe(setattr, job, "message", msg)
+        await asyncio.to_thread(emulator.setup, log)
+        job.results.append({"ok": True, "label": "emulator setup"})
+        job.message = ""
+    return {"job": manager.start("emulator", "Set up Android emulator", work, serial=False).id}
+
+
+# ---------- live screen (H.264 via WebCodecs, PNG fallback) ----------
 
 @app.websocket("/ws/screen")
 async def screen(ws: WebSocket):
@@ -259,15 +559,42 @@ async def screen(ws: WebSocket):
         await ws.close(code=1008)
         return
     await ws.accept()
+    mode = "png" if ws.query_params.get("mode") == "png" else "h264"
+    size = {"w": 1080, "h": 1920}
+
+    async def refresh_size():
+        try:
+            s = await adb.screen_size()
+            size["w"], size["h"] = s["width"], s["height"]
+        except adb.AdbError:
+            pass
+
+    await refresh_size()
 
     async def pump():
-        while True:
-            try:
-                await ws.send_bytes(await adb.screenshot())
-            except adb.AdbError as e:
-                await ws.send_text(json.dumps({"error": str(e)}))
-                await asyncio.sleep(2)
-            await asyncio.sleep(1 / config.STREAM_FPS)
+        try:
+            await ws.send_text(json.dumps({"mode": mode}))
+            if mode == "h264":
+                while True:
+                    try:
+                        async for nal in video.h264_stream(size["w"], size["h"]):
+                            if nal is None:
+                                await ws.send_text(json.dumps({"reset": True}))
+                            else:
+                                await ws.send_bytes(nal)
+                    except adb.AdbError as e:
+                        await ws.send_text(json.dumps({"error": str(e)}))
+                        await asyncio.sleep(3)
+            else:
+                while True:
+                    try:
+                        await ws.send_bytes(await adb.screenshot())
+                    except adb.AdbError as e:
+                        await ws.send_text(json.dumps({"error": str(e)}))
+                        await asyncio.sleep(2)
+                    await asyncio.sleep(1 / config.STREAM_FPS)
+        except (WebSocketDisconnect, RuntimeError):
+            pass
 
     task = asyncio.create_task(pump())
     try:
@@ -275,14 +602,21 @@ async def screen(ws: WebSocket):
             m = json.loads(await ws.receive_text())
             try:
                 t = m.get("type")
+                # coordinates are fractions (0..1) of the picture, so any stream size works
+                px = lambda k, dim: int(min(max(float(m[k]), 0.0), 1.0) * (size[dim] - 1))  # noqa: E731
                 if t == "tap":
-                    await adb.tap(m["x"], m["y"])
+                    await adb.tap(px("x", "w"), px("y", "h"))
                 elif t == "swipe":
-                    await adb.swipe(m["x1"], m["y1"], m["x2"], m["y2"], int(m.get("ms", 200)))
+                    await adb.swipe(px("x1", "w"), px("y1", "h"), px("x2", "w"), px("y2", "h"),
+                                    int(m.get("ms", 200)))
                 elif t == "key":
                     await adb.key(m["key"])
                 elif t == "text":
                     await adb.text(m["text"])
+                elif t == "rotate":
+                    await adb.rotate(int(m["rotation"]))
+                    await asyncio.sleep(0.5)
+                    await refresh_size()
             except (adb.AdbError, KeyError, ValueError):
                 pass
     except WebSocketDisconnect:

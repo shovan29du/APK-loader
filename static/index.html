@@ -3,50 +3,67 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>APK Loader</title>
 <style>
-:root{--bg:#f6f7f9;--fg:#1c1e21;--card:#fff;--line:#d9dce1;--accent:#2563eb}
-@media(prefers-color-scheme:dark){:root{--bg:#15171a;--fg:#e6e8eb;--card:#1e2126;--line:#33373d;--accent:#5b8def}}
+:root{--bg:#f6f7f9;--fg:#1c1e21;--card:#fff;--line:#d9dce1;--accent:#2563eb;--ok:#16a34a;--bad:#c62828}
+@media(prefers-color-scheme:dark){:root{--bg:#15171a;--fg:#e6e8eb;--card:#1e2126;--line:#33373d;--accent:#5b8def;--ok:#4ade80;--bad:#f87171}}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px system-ui,sans-serif}
-main{display:grid;grid-template-columns:minmax(320px,440px) 1fr;gap:16px;padding:16px;min-height:100vh}
+main{display:grid;grid-template-columns:minmax(340px,460px) 1fr;gap:16px;padding:16px;min-height:100vh}
 @media(max-width:800px){main{grid-template-columns:1fr}}
 .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px}
-h1{font-size:18px;margin:0 0 8px}.tabs{display:flex;gap:4px;flex-wrap:wrap;margin-bottom:10px}
-button,input,select{font:inherit;color:inherit;background:var(--card);border:1px solid var(--line);border-radius:6px;padding:6px 10px}
+h1{font-size:18px;margin:0 0 4px}h3{margin:10px 0 6px;font-size:13px}
+.tabs{display:flex;gap:4px;flex-wrap:wrap;margin:8px 0 10px}
+button,input,select,textarea{font:inherit;color:inherit;background:var(--card);border:1px solid var(--line);border-radius:6px;padding:6px 10px}
 button{cursor:pointer}button.on,button.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
-button.danger{color:#c62828}.row{display:flex;gap:6px;margin-bottom:8px}.row input{flex:1;min-width:0}
+button.danger{color:var(--bad)}.row{display:flex;gap:6px;margin-bottom:8px;align-items:center}.row input{flex:1;min-width:0}
 .item{display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--line)}
 .item img{width:32px;height:32px;border-radius:6px}.item .t{flex:1;min-width:0;overflow-wrap:anywhere}
-.item small{opacity:.65;display:block}.pane{display:none}.pane.on{display:block}
-#log{white-space:pre-wrap;font-size:12px;margin-top:8px;max-height:140px;overflow:auto}
+small{opacity:.65}.pane{display:none}.pane.on{display:block}
+#banner{display:none;background:var(--accent);color:#fff;border-radius:6px;padding:6px 10px;margin:6px 0}
+#jobs .job{border:1px solid var(--line);border-radius:8px;padding:6px 8px;margin-top:6px;font-size:12px}
+progress{width:100%;height:8px}.ok{color:var(--ok)}.bad{color:var(--bad)}
+details{margin-top:4px}details pre{white-space:pre-wrap;font-size:11px;margin:4px 0}
 #screenwrap{display:flex;flex-direction:column;align-items:center;gap:8px}
-canvas{max-width:100%;max-height:75vh;background:#000;border-radius:8px;touch-action:none;cursor:pointer}
-#status{font-size:12px;opacity:.7}
+canvas{max-width:100%;max-height:72vh;background:#000;border-radius:8px;touch-action:none;cursor:pointer}
+#status{font-size:12px;opacity:.75}
 </style></head><body><main>
 <section class="card">
  <h1>APK Loader</h1><div id="status">connecting…</div>
+ <div id="banner"></div>
  <div class="tabs" id="tabs"></div>
 
  <div class="pane" id="p-market">
   <div class="row"><select id="prov"></select><input id="q" placeholder="Search apps…"><button id="go">Search</button></div>
   <div id="results"></div>
   <button class="primary" id="installSel">Install selected</button>
-  <label><input type="checkbox" id="runLast"> launch last installed</label>
+  <label><input type="checkbox" id="runLast"> launch last</label>
  </div>
 
  <div class="pane" id="p-url">
-  <textarea id="urls" rows="4" style="width:100%" placeholder="One direct .apk URL per line"></textarea>
+  <textarea id="urls" rows="4" style="width:100%" placeholder="One direct URL per line (.apk .xapk .apks .aab)"></textarea>
   <button class="primary" id="installUrls">Download &amp; install</button>
  </div>
 
  <div class="pane" id="p-upload">
-  <input type="file" id="files" accept=".apk" multiple>
-  <p><label><input type="checkbox" id="split"> files are split APKs of ONE app</label><br>
+  <input type="file" id="files" accept=".apk,.xapk,.apks,.aab" multiple>
+  <p><label><input type="checkbox" id="split"> the .apk files are split APKs of ONE app</label><br>
   <label><input type="checkbox" id="runUp"> launch after install</label></p>
-  <button class="primary" id="doUpload">Install</button>
+  <button class="primary" id="doUpload">Install</button> <progress id="upProg" value="0" max="1" style="display:none;width:120px"></progress>
  </div>
 
  <div class="pane" id="p-apps"><button id="refApps">Refresh</button><div id="apps"></div></div>
+ <div class="pane" id="p-upd"><div class="row"><button id="refUpd">Check now</button><button class="primary" id="updAll">Update all</button></div><div id="upd"></div></div>
  <div class="pane" id="p-lib"><button id="refLib">Refresh</button><div id="lib"></div></div>
- <div id="log"></div>
+
+ <div class="pane" id="p-dev">
+  <h3>Emulator</h3><div class="row"><button id="emuStart">Start</button><button id="emuStop">Stop</button><button id="emuSetup">Set up / repair</button></div>
+  <h3>Controls</h3><div class="row"><button id="rotL">⟲ Rotate</button><button id="rotR">⟳ Rotate</button><button id="shot">📷 Screenshot</button></div>
+  <h3>Files <small id="cwd"></small></h3>
+  <div class="row"><button id="up">↑ Up</button><input type="file" id="fup"><button id="fupBtn">Upload here</button></div>
+  <div id="fl"></div>
+  <h3>App data backups</h3><div class="row"><button id="refBk">Refresh</button></div><div id="bk"></div>
+ </div>
+
+ <div id="jobs"></div>
+ <label style="display:block;margin-top:8px"><input type="checkbox" id="unsafe"> install even if safety checks fail</label>
 </section>
 
 <section class="card" id="screenwrap">
@@ -59,7 +76,7 @@ canvas{max-width:100%;max-height:75vh;background:#000;border-radius:8px;touch-ac
 <script>
 const $=s=>document.querySelector(s);
 let token=localStorage.getItem('apkToken')||'';
-const log=m=>{$('#log').textContent=m+'\n'+$('#log').textContent};
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 async function api(path,opts={}){
   opts.headers={...(opts.headers||{}),...(token?{Authorization:'Bearer '+token}:{})};
   let r=await fetch(path,opts);
@@ -68,78 +85,158 @@ async function api(path,opts={}){
   return r;
 }
 const j=(p,o)=>api(p,o).then(r=>r.json());
-const post=(p,b)=>j(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});
-const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-async function saveBlob(path,name){
-  const b=await (await api(path)).blob();const a=document.createElement('a');
+const post=(p,b)=>j(p,{method:'POST',headers:{'Content-Type':'application/json'},body:b===undefined?undefined:JSON.stringify(b)});
+async function saveBlob(path,name){const b=await (await api(path)).blob();const a=document.createElement('a');
   a.href=URL.createObjectURL(b);a.download=name;a.click();URL.revokeObjectURL(a.href)}
-const report=res=>log(res.results.map(r=>(r.ok?'✔ ':'✘ ')+(r.file||r.id)+(r.package?' → '+r.package:'')+(r.error?': '+r.error:'')).join('\n'));
+const say=m=>{$('#status').textContent=m};
 
-// tabs
-const tabs=[['market','Marketplaces'],['url','URLs'],['upload','Upload'],['apps','Installed'],['lib','APK files']];
-tabs.forEach(([id,l],i)=>{const b=document.createElement('button');b.textContent=l;b.onclick=()=>{
+/* ---------- jobs (progress bars) ---------- */
+let watching=new Set(),poll=null;
+function watch(id){watching.add(id);if(!poll)poll=setInterval(refreshJobs,700);refreshJobs()}
+async function refreshJobs(){
+  const jobs=(await j('/api/jobs').catch(()=>[])).slice(0,6);
+  $('#jobs').innerHTML=jobs.map(x=>{
+    const res=x.results.map(r=>`<div class="${r.ok?'ok':'bad'}">${r.ok?'✔':'✘'} ${esc(r.label||'')}${r.package?' → '+esc(r.package):''}${r.error?': '+esc(r.error):''}${r.launch_error?' (launch: '+esc(r.launch_error)+')':''}
+      ${r.safety?`<details><summary>safety checks</summary><pre>sha256 ${r.safety.sha256}\n${r.safety.checks.map(c=>`[${c.status}] ${c.name}: ${c.detail}`).join('\n')}</pre></details>`:''}</div>`).join('');
+    return `<div class="job"><b>${esc(x.title)}</b> <small>${x.status}</small>
+      ${x.status=='running'||x.status=='queued'?`<progress value="${x.progress}" max="1"></progress><div>${esc(x.message)}</div>`:''}
+      ${x.status=='error'&&x.message?`<div class="bad">${esc(x.message)}</div>`:''}${res}</div>`}).join('');
+  const active=jobs.some(x=>x.status=='running'||x.status=='queued');
+  if(!active&&poll){clearInterval(poll);poll=null;loadApps();checkUpdates()}
+}
+
+/* ---------- tabs ---------- */
+const tabs=[['market','Marketplaces'],['url','URLs'],['upload','Upload'],['apps','Installed'],['upd','Updates'],['lib','APK files'],['dev','Device']];
+tabs.forEach(([id,l],i)=>{const b=document.createElement('button');b.textContent=l;b.id='tab-'+id;b.onclick=()=>{
   document.querySelectorAll('.pane').forEach(p=>p.classList.toggle('on',p.id=='p-'+id));
   [...$('#tabs').children].forEach(c=>c.classList.toggle('on',c==b));
-  if(id=='apps')loadApps();if(id=='lib')loadLib()};$('#tabs').append(b);if(!i)b.click()});
+  if(id=='apps')loadApps();if(id=='lib')loadLib();if(id=='upd')loadUpd();if(id=='dev'){loadFiles();loadBk()}};$('#tabs').append(b);if(!i)b.click()});
 
-// marketplace
+/* ---------- marketplaces / urls ---------- */
 j('/api/providers').then(ps=>ps.filter(p=>p!='direct').forEach(p=>$('#prov').add(new Option(p,p))));
-$('#go').onclick=async()=>{
-  $('#results').textContent='Searching…';
+$('#go').onclick=async()=>{$('#results').textContent='Searching…';
   try{const apps=await j(`/api/search?provider=${$('#prov').value}&q=${encodeURIComponent($('#q').value)}`);
    $('#results').innerHTML=apps.map(a=>`<label class="item"><input type="checkbox" data-p="${esc(a.provider)}" data-id="${esc(a.id)}">
-    ${a.icon?`<img src="${esc(a.icon)}" alt="">`:''}<span class="t">${esc(a.name)}<small>${esc(a.id)} ${esc(a.version)}</small></span></label>`).join('')||'No results'}
+    ${a.icon?`<img src="${esc(a.icon)}" alt="">`:''}<span class="t">${esc(a.name)}<small><br>${esc(a.id)} ${esc(a.version)}</small></span></label>`).join('')||'No results'}
   catch(e){$('#results').textContent=e.message}};
 $('#q').onkeydown=e=>e.key=='Enter'&&$('#go').click();
-async function batch(items,run){log('Installing '+items.length+' app(s)…');
-  try{report(await post('/api/install',{items,run_last:run}))}catch(e){log('✘ '+e.message)}}
+async function batch(items,run){try{watch((await post('/api/install',{items,run_last:run,allow_unsafe:$('#unsafe').checked})).job)}catch(e){say('✘ '+e.message)}}
 $('#installSel').onclick=()=>{const items=[...document.querySelectorAll('#results input:checked')].map(c=>({provider:c.dataset.p,id:c.dataset.id}));
-  items.length?batch(items,$('#runLast').checked):log('Select at least one app')};
+  items.length?batch(items,$('#runLast').checked):say('Select at least one app')};
 $('#installUrls').onclick=()=>{const items=$('#urls').value.split('\n').map(s=>s.trim()).filter(Boolean).map(id=>({provider:'direct',id}));
   items.length&&batch(items,false)};
 
-// upload
-$('#doUpload').onclick=async()=>{const fs=$('#files').files;if(!fs.length)return log('Choose .apk files');
+/* ---------- upload (with real upload progress) ---------- */
+$('#doUpload').onclick=()=>{const fs=$('#files').files;if(!fs.length)return say('Choose files');
   const fd=new FormData();[...fs].forEach(f=>fd.append('files',f));
-  fd.append('split',$('#split').checked);fd.append('run',$('#runUp').checked);
-  log('Uploading…');try{report(await j('/api/upload',{method:'POST',body:fd}))}catch(e){log('✘ '+e.message)}};
+  fd.append('split',$('#split').checked);fd.append('run',$('#runUp').checked);fd.append('allow_unsafe',$('#unsafe').checked);
+  const x=new XMLHttpRequest();x.open('POST','/api/upload');if(token)x.setRequestHeader('Authorization','Bearer '+token);
+  const pr=$('#upProg');pr.style.display='';x.upload.onprogress=e=>{pr.value=e.loaded/(e.total||1)};
+  x.onload=()=>{pr.style.display='none';let d={};try{d=JSON.parse(x.responseText)}catch{}
+    x.status==200?watch(d.job):say('✘ '+(d.detail||x.statusText))};
+  x.onerror=()=>{pr.style.display='none';say('✘ upload failed')};x.send(fd)};
 
-// installed apps: launch / copy / uninstall
-async function loadApps(){const ps=await j('/api/apps');
+/* ---------- installed apps ---------- */
+async function loadApps(){const ps=await j('/api/apps').catch(()=>[]);
   $('#apps').innerHTML=ps.map(p=>`<div class="item"><span class="t">${esc(p)}</span>
    <button data-a="launch" data-p="${esc(p)}">Run</button><button data-a="copy" data-p="${esc(p)}">Copy APK</button>
+   <button data-a="backup" data-p="${esc(p)}">Backup</button>
    <button class="danger" data-a="uninstall" data-p="${esc(p)}">Uninstall</button></div>`).join('')||'No user apps installed'}
 $('#apps').onclick=async e=>{const b=e.target.closest('button');if(!b)return;const p=b.dataset.p;
-  try{if(b.dataset.a=='launch'){await post('/api/launch',{package:p});log('Launched '+p)}
-   else if(b.dataset.a=='copy'){await saveBlob(`/api/apps/${p}/apk`,p+'.apk');log('Copied '+p)}
-   else if(confirm('Uninstall '+p+'?')){await post('/api/uninstall',{package:p});log('Uninstalled '+p);loadApps()}}
-  catch(err){log('✘ '+err.message)}};
+  try{if(b.dataset.a=='launch'){await post('/api/launch',{package:p});say('Launched '+p)}
+   else if(b.dataset.a=='copy'){await saveBlob(`/api/apps/${p}/apk`,p+'.apk')}
+   else if(b.dataset.a=='backup'){say('Backing up…');const r=await post('/api/backups',{package:p});say('Backup saved: '+r.name)}
+   else if(confirm('Uninstall '+p+'?')){await post('/api/uninstall',{package:p});say('Uninstalled '+p);loadApps()}}
+  catch(err){say('✘ '+err.message)}};
 $('#refApps').onclick=loadApps;
 
-// stored APK files: download copy / delete
+/* ---------- updates ---------- */
+async function loadUpd(refresh){say('Checking for updates…');
+  const d=await j('/api/updates'+(refresh?'?refresh=true':'')).catch(e=>({updates:[],err:e.message}));
+  $('#upd').innerHTML=d.updates.map(u=>`<div class="item"><span class="t">${esc(u.package)}<small><br>${u.installed} → ${u.latest} ${esc(u.latest_name)} (${esc(u.provider)})</small></span>
+   <button data-p="${esc(u.package)}">Update</button></div>`).join('')||'Everything installed from marketplaces is up to date';
+  $('#tab-upd').textContent='Updates'+(d.updates.length?` (${d.updates.length})`:'');say('')}
+async function checkUpdates(){try{const d=await j('/api/updates');$('#tab-upd').textContent='Updates'+(d.updates.length?` (${d.updates.length})`:'')}catch{}}
+$('#refUpd').onclick=()=>loadUpd(true);
+$('#updAll').onclick=async()=>{try{watch((await post('/api/updates/apply')).job)}catch(e){say('✘ '+e.message)}};
+$('#upd').onclick=async e=>{const b=e.target.closest('button');if(b)try{watch((await post('/api/updates/apply',[b.dataset.p])).job)}catch(err){say('✘ '+err.message)}};
+
+/* ---------- stored APK files ---------- */
 async function loadLib(){const l=await j('/api/apks');
-  $('#lib').innerHTML=l.map(d=>`<div class="item"><span class="t">${d.files.map(f=>esc(f.name)+` <small>${(f.size/1048576).toFixed(1)} MB</small>`).join('')}</span>
+  $('#lib').innerHTML=l.map(d=>`<div class="item"><span class="t">${d.files.map(f=>esc(f.name)+` <small>${(f.size/1048576).toFixed(1)} MB</small>`).join('<br>')}</span>
    <button data-a="dl" data-id="${d.id}" data-n="${esc(d.files[0]?.name||'')}">Copy</button>
-   <button class="danger" data-a="del" data-id="${d.id}">Delete</button></div>`).join('')||'No stored APK files'}
+   <button class="danger" data-a="del" data-id="${d.id}">Delete</button></div>`).join('')||'No stored files (old ones are removed automatically after 7 days)'}
 $('#lib').onclick=async e=>{const b=e.target.closest('button');if(!b)return;
   try{if(b.dataset.a=='dl')await saveBlob(`/api/apks/${b.dataset.id}/${encodeURIComponent(b.dataset.n)}`,b.dataset.n);
-   else if(confirm('Delete this APK file?')){await j('/api/apks/'+b.dataset.id,{method:'DELETE'});loadLib()}}
-  catch(err){log('✘ '+err.message)}};
+   else if(confirm('Delete this file?')){await j('/api/apks/'+b.dataset.id,{method:'DELETE'});loadLib()}}
+  catch(err){say('✘ '+err.message)}};
 $('#refLib').onclick=loadLib;
 
-// live screen
-const cv=$('#screen'),ctx=cv.getContext('2d');let ws,dev=null;
-function connect(){ws=new WebSocket((location.protocol=='https:'?'wss://':'ws://')+location.host+'/ws/screen'+(token?'?token='+encodeURIComponent(token):''));
- ws.binaryType='blob';
- ws.onmessage=async m=>{if(typeof m.data=='string'){$('#status').textContent=JSON.parse(m.data).error;return}
-  const bmp=await createImageBitmap(m.data);cv.width=bmp.width;cv.height=bmp.height;ctx.drawImage(bmp,0,0);dev={w:bmp.width,h:bmp.height};$('#status').textContent='connected'};
- ws.onclose=()=>setTimeout(connect,2000)}
+/* ---------- device: emulator, rotate, screenshot, files, backups ---------- */
+$('#emuStart').onclick=async()=>{try{watch((await post('/api/emulator/start')).job)}catch(e){say('✘ '+e.message)}};
+$('#emuStop').onclick=()=>post('/api/emulator/stop').then(()=>say('Emulator stopped'));
+$('#emuSetup').onclick=async()=>{if(confirm('Downloads Java + Android SDK + a system image (~2 GB) and accepts the Android SDK license (developer.android.com/studio/terms). Continue?'))
+  try{watch((await post('/api/emulator/setup')).job)}catch(e){say('✘ '+e.message)}};
+let rot=0;const doRot=d=>{rot=(rot+d+4)%4;send({type:'rotate',rotation:rot})};
+$('#rotL').onclick=()=>doRot(-1);$('#rotR').onclick=()=>doRot(1);
+$('#shot').onclick=()=>saveBlob('/api/screenshot','screenshot.png').catch(e=>say('✘ '+e.message));
+let cwd='/sdcard';
+async function loadFiles(p){if(p)cwd=p;try{const d=await j('/api/files?path='+encodeURIComponent(cwd));cwd=d.path;$('#cwd').textContent=cwd;
+  $('#fl').innerHTML=d.items.map(i=>`<div class="item"><span class="t">${i.dir?'📁 ':''}${esc(i.name)} <small>${i.dir?'':(i.size/1024).toFixed(0)+' KB'}</small></span>
+   ${i.dir?`<button data-a="open" data-n="${esc(i.name)}">Open</button>`:`<button data-a="get" data-n="${esc(i.name)}">Download</button>`}
+   <button class="danger" data-a="rm" data-n="${esc(i.name)}">✕</button></div>`).join('')||'Empty'}catch(e){$('#fl').textContent=e.message}}
+$('#up').onclick=()=>loadFiles(cwd.replace(/\/[^/]+$/,'')||'/sdcard');
+$('#fl').onclick=async e=>{const b=e.target.closest('button');if(!b)return;const p=cwd+'/'+b.dataset.n;
+  try{if(b.dataset.a=='open')loadFiles(p);else if(b.dataset.a=='get')await saveBlob('/api/files/download?path='+encodeURIComponent(p),b.dataset.n);
+   else if(confirm('Delete '+p+'?')){await j('/api/files?path='+encodeURIComponent(p),{method:'DELETE'});loadFiles()}}catch(err){say('✘ '+err.message)}};
+$('#fupBtn').onclick=async()=>{const f=$('#fup').files[0];if(!f)return;const fd=new FormData();fd.append('path',cwd);fd.append('file',f);
+  try{await j('/api/files/upload',{method:'POST',body:fd});loadFiles()}catch(e){say('✘ '+e.message)}};
+async function loadBk(){const l=await j('/api/backups').catch(()=>[]);
+  $('#bk').innerHTML=l.map(b=>`<div class="item"><span class="t">${esc(b.name)} <small>${(b.size/1048576).toFixed(1)} MB</small></span>
+   <button data-a="rs" data-n="${esc(b.name)}">Restore</button><button data-a="dl" data-n="${esc(b.name)}">Copy</button><button class="danger" data-a="del" data-n="${esc(b.name)}">✕</button></div>`).join('')||'No backups (needs a rootable device: the bundled emulator)'}
+$('#bk').onclick=async e=>{const b=e.target.closest('button');if(!b)return;const n=encodeURIComponent(b.dataset.n);
+  try{if(b.dataset.a=='rs'){if(confirm('Overwrite the app data with this backup?')){await post(`/api/backups/${n}/restore`);say('Restored')}}
+   else if(b.dataset.a=='dl')await saveBlob('/api/backups/'+n,b.dataset.n);
+   else if(confirm('Delete backup?')){await j('/api/backups/'+n,{method:'DELETE'});loadBk()}}catch(err){say('✘ '+err.message)}};
+$('#refBk').onclick=loadBk;
+
+/* ---------- status banner + auto refresh ---------- */
+async function refreshStatus(){try{const s=await j('/api/status');
+  if(s.emulator&&s.emulator.message)say(s.emulator.message);else if(!s.connected)say('No device connected'+(s.emulator&&s.emulator.installed?' — starting emulator…':''));
+  const v=await j('/api/version');const bn=$('#banner');
+  if(v.available){bn.style.display='block';bn.innerHTML=`APK Loader ${esc(v.latest)} is available (you have ${esc(v.current)}). Run <code>python full_install.py --update</code> or <a style="color:#fff" href="${esc(v.url)}" target="_blank">download</a>.`}}catch{}}
+refreshStatus();setInterval(refreshStatus,60000);refreshJobs();
+
+/* ---------- live screen: H.264 via WebCodecs, PNG fallback ---------- */
+const cv=$('#screen'),ctx=cv.getContext('2d');let ws,mode='h264',decoder=null,curCodec='',sps=null,pps=null,needKey=true,ts=0,fallback=false;
+const hex=b=>b.toString(16).padStart(2,'0');
+function resetDecoder(){try{decoder&&decoder.state!='closed'&&decoder.close()}catch{}decoder=null;curCodec='';needKey=true}
+function configure(codec){resetDecoder();curCodec=codec;
+  decoder=new VideoDecoder({output:f=>{if(cv.width!=f.displayWidth||cv.height!=f.displayHeight){cv.width=f.displayWidth;cv.height=f.displayHeight}ctx.drawImage(f,0,0);f.close()},
+    error:e=>{console.warn(e);fallback=true;ws&&ws.close()}});
+  decoder.configure({codec,optimizeForLatency:true});needKey=true}
+const cat=(...a)=>{const o=new Uint8Array(a.reduce((n,x)=>n+x.length,0));let p=0;a.forEach(x=>{o.set(x,p);p+=x.length});return o};
+function onNal(u){const i=u[2]==1?3:4,t=u[i]&31;
+  if(t==7){sps=u;const c='avc1.'+hex(u[i+1])+hex(u[i+2])+hex(u[i+3]);if(c!=curCodec||!decoder)configure(c);return}
+  if(t==8){pps=u;return}
+  if(!decoder||decoder.state!='configured')return;
+  if(t==5&&sps&&pps){needKey=false;decoder.decode(new EncodedVideoChunk({type:'key',timestamp:ts+=33333,data:cat(sps,pps,u)}))}
+  else if(t==1&&!needKey){if(decoder.decodeQueueSize<8)decoder.decode(new EncodedVideoChunk({type:'delta',timestamp:ts+=33333,data:u}))}}
+function connect(){
+  const useVideo=!fallback&&window.VideoDecoder&&window.EncodedVideoChunk;
+  ws=new WebSocket((location.protocol=='https:'?'wss://':'ws://')+location.host+'/ws/screen?mode='+(useVideo?'h264':'png')+(token?'&token='+encodeURIComponent(token):''));
+  ws.binaryType='arraybuffer';
+  ws.onmessage=async m=>{
+    if(typeof m.data=='string'){const d=JSON.parse(m.data);if(d.mode){mode=d.mode;resetDecoder()}if(d.reset)resetDecoder();if(d.error)say(d.error);return}
+    if(mode=='png'){const bmp=await createImageBitmap(new Blob([m.data]));cv.width=bmp.width;cv.height=bmp.height;ctx.drawImage(bmp,0,0)}
+    else onNal(new Uint8Array(m.data))};
+  ws.onclose=()=>{resetDecoder();setTimeout(connect,2000)}}
 connect();
-const pt=e=>{const r=cv.getBoundingClientRect();return[Math.round((e.clientX-r.left)*cv.width/r.width),Math.round((e.clientY-r.top)*cv.height/r.height)]};
+const pt=e=>{const r=cv.getBoundingClientRect();return[(e.clientX-r.left)/r.width,(e.clientY-r.top)/r.height]};
 const send=o=>ws&&ws.readyState==1&&ws.send(JSON.stringify(o));
 let down=null;cv.onpointerdown=e=>down={p:pt(e),t:Date.now()};
 cv.onpointerup=e=>{if(!down)return;const[x1,y1]=down.p,[x2,y2]=pt(e),ms=Date.now()-down.t;down=null;
- Math.hypot(x2-x1,y2-y1)<12?send({type:'tap',x:x2,y:y2}):send({type:'swipe',x1,y1,x2,y2,ms:Math.max(ms,100)})};
+ Math.hypot((x2-x1)*cv.width,(y2-y1)*cv.height)<12?send({type:'tap',x:x2,y:y2}):send({type:'swipe',x1,y1,x2,y2,ms:Math.max(ms,100)})};
 document.querySelectorAll('[data-k]').forEach(b=>b.onclick=()=>send({type:'key',key:b.dataset.k}));
 $('#type').onkeydown=e=>{if(e.key=='Enter'){send({type:'text',text:e.target.value});send({type:'key',key:'KEYCODE_ENTER'});e.target.value=''}};
 </script></body></html>

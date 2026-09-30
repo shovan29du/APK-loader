@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
 """One-shot installer for APK Loader on Windows, macOS and Linux (stdlib only).
 
-    python full_install.py              install (or update) and create shortcuts
+    python full_install.py              fully automatic install, then launches the app
+    python full_install.py --update     fetch the latest release and reinstall in place
     python full_install.py --uninstall  remove the app and its shortcuts
     python full_install.py --dir PATH   custom install directory
-    python full_install.py --no-adb     skip downloading Android platform-tools
+    python full_install.py --no-emulator  skip the Android emulator (bring your own device)
+    python full_install.py --no-launch    do not start the app when finished
 
-It copies the app to a per-user directory, builds a virtualenv, installs the
-dependencies, fetches adb from Google, and puts a launcher shortcut on the
-normal Desktop *and* the OneDrive Desktop (Windows folder backup) if present.
+Everything is automatic: app files, virtualenv, dependencies, adb, Java, the
+Android SDK + emulator + system image, bundletool, and a launcher shortcut on
+the normal Desktop *and* the OneDrive Desktop (Windows folder backup).
+
+NOTE: running the installer with the emulator enabled accepts the Android SDK
+License Agreement on your behalf (https://developer.android.com/studio/terms).
+Use --no-emulator to opt out. The emulator download is roughly 2 GB.
 """
 import argparse
 import os
@@ -17,6 +23,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import json
 import tempfile
 import urllib.request
 import zipfile
@@ -24,7 +31,8 @@ from pathlib import Path
 
 APP_NAME = "APK Loader"
 SRC = Path(__file__).resolve().parent
-PAYLOAD = ["app", "static", "run.py", "requirements.txt", "README.md"]
+PAYLOAD = ["app", "static", "plugins", "run.py", "requirements.txt", "README.md"]
+REPO = "shovan29du/APK-loader"
 SYSTEM = platform.system()  # Windows / Darwin / Linux
 PT_URL = "https://dl.google.com/android/repository/platform-tools-latest-{}.zip"
 PT_OS = {"Windows": "windows", "Darwin": "darwin", "Linux": "linux"}
@@ -206,7 +214,24 @@ def install_adb(dest: Path):
                 f.chmod(f.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
-def install(dest: Path, with_adb: bool):
+def setup_emulator(dest: Path):
+    if (dest / "android-sdk" / "emulator").exists():
+        return say("Android emulator already set up.")
+    say("Setting up the Android emulator (Java, SDK, system image, bundletool)…")
+    r = subprocess.run([str(venv_python(dest)), str(dest / "run.py"), "--setup-emulator"], cwd=dest)
+    if r.returncode != 0:
+        say("Emulator setup failed. The app still works with your own adb device; "
+            "retry later with:  python run.py --setup-emulator")
+
+
+def launch(dest: Path):
+    say("Starting APK Loader…")
+    kw = {"creationflags": 0x00000008 | 0x00000200} if SYSTEM == "Windows" else {"start_new_session": True}
+    subprocess.Popen([str(pythonw(dest)), str(dest / "run.py")], cwd=dest,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kw)
+
+
+def install(dest: Path, with_adb: bool, with_emulator: bool = True, do_launch: bool = True):
     check_python()
     say(f"Installing to {dest}")
     copy_payload(dest)
@@ -216,11 +241,36 @@ def install(dest: Path, with_adb: bool):
             install_adb(dest)
         except Exception as e:
             say(f"adb download failed ({e}). Install Android platform-tools manually.")
+    if with_emulator:
+        setup_emulator(dest)
     shortcuts = make_shortcuts(dest)
     (dest / "shortcuts.txt").write_text("\n".join(map(str, shortcuts)))
     say(f"Done. Launch '{APP_NAME}' from your Desktop, or run: {venv_python(dest)} {dest / 'run.py'}")
-    say("Note: you also need an Android device/emulator reachable by adb "
-        "(default localhost:5555; set ADB_SERIAL). See README.md.")
+    if not with_emulator:
+        say("No emulator installed: connect a device/emulator via adb (set ADB_SERIAL). See README.md.")
+    if do_launch:
+        launch(dest)
+
+
+def update(dest: Path, ref: str | None):
+    """Download the newest release (or branch/tag `ref`) and reinstall over the current install."""
+    if not ref:
+        try:
+            req = urllib.request.Request(f"https://api.github.com/repos/{REPO}/releases/latest",
+                                         headers={"User-Agent": "apk-loader"})
+            ref = json.load(urllib.request.urlopen(req, timeout=30))["tag_name"]
+        except Exception:
+            sys.exit("No published release found. Use --ref BRANCH_OR_TAG to update from a specific ref.")
+    say(f"Updating to {ref}…")
+    with tempfile.TemporaryDirectory() as t:
+        z = Path(t) / "src.zip"
+        urllib.request.urlretrieve(f"https://github.com/{REPO}/archive/{ref}.zip", z)
+        with zipfile.ZipFile(z) as zf:
+            zf.extractall(t)
+        root = next(p for p in Path(t).iterdir() if p.is_dir())
+        subprocess.run([sys.executable, str(root / "full_install.py"), "--dir", str(dest),
+                        "--no-launch"], check=True)
+    launch(dest)
 
 
 def uninstall(dest: Path):
@@ -240,12 +290,18 @@ def main():
     ap.add_argument("--dir", type=Path, default=default_dir())
     ap.add_argument("--uninstall", action="store_true")
     ap.add_argument("--no-adb", action="store_true")
+    ap.add_argument("--no-emulator", action="store_true")
+    ap.add_argument("--no-launch", action="store_true")
+    ap.add_argument("--update", action="store_true")
+    ap.add_argument("--ref", help="branch or tag for --update")
     a = ap.parse_args()
     dest = a.dir.expanduser().resolve()
     if a.uninstall:
         uninstall(dest)
+    elif a.update:
+        update(dest, a.ref)
     else:
-        install(dest, not a.no_adb)
+        install(dest, not a.no_adb, not a.no_emulator, not a.no_launch)
 
 
 if __name__ == "__main__":

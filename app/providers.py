@@ -9,9 +9,12 @@ import ipaddress
 import re
 import socket
 from dataclasses import dataclass, asdict
+from pathlib import PurePosixPath
 from urllib.parse import urlparse
 
 import httpx
+
+from . import config
 
 TIMEOUT = httpx.Timeout(30.0, connect=10.0)
 HEADERS = {"User-Agent": "apk-loader/1.0"}
@@ -35,6 +38,8 @@ def check_public_url(url: str) -> None:
     u = urlparse(url)
     if u.scheme not in ("http", "https") or not u.hostname:
         raise ValueError("only http(s) URLs are allowed")
+    if config.ALLOW_PRIVATE_URLS:
+        return
     try:
         infos = socket.getaddrinfo(u.hostname, u.port or (443 if u.scheme == "https" else 80))
     except socket.gaierror:
@@ -45,14 +50,24 @@ def check_public_url(url: str) -> None:
             raise ValueError("URL resolves to a non-public address")
 
 
+@dataclass
+class Resolved:
+    url: str
+    package: str = ""
+    ext: str = ".apk"
+    sha256: str = ""
+    md5: str = ""
+    version_code: int = 0
+    version_name: str = ""
+
+
 class Provider:
     name = ""
 
     async def search(self, client: httpx.AsyncClient, q: str) -> list[AppInfo]:
         raise NotImplementedError
 
-    async def resolve(self, client: httpx.AsyncClient, app_id: str) -> tuple[str, str]:
-        """Return (download_url, package_hint)."""
+    async def resolve(self, client: httpx.AsyncClient, app_id: str) -> "Resolved":
         raise NotImplementedError
 
 
@@ -74,10 +89,14 @@ class FDroid(Provider):
     async def resolve(self, client, app_id):
         r = await client.get(f"https://f-droid.org/api/v1/packages/{app_id}")
         r.raise_for_status()
-        code = r.json().get("suggestedVersionCode")
+        data = r.json()
+        code = data.get("suggestedVersionCode")
         if not code:
             raise ValueError("no version available")
-        return f"https://f-droid.org/repo/{app_id}_{code}.apk", app_id
+        name = next((v.get("versionName", "") for v in data.get("packages", [])
+                     if v.get("versionCode") == code), "")
+        return Resolved(f"https://f-droid.org/repo/{app_id}_{code}.apk", app_id,
+                        version_code=int(code), version_name=name)
 
 
 class Aptoide(Provider):
@@ -99,7 +118,9 @@ class Aptoide(Provider):
         f = r.json().get("nodes", {}).get("meta", {}).get("data", {}).get("file", {})
         if not f.get("path"):
             raise ValueError("no download available")
-        return f["path"], app_id
+        return Resolved(f["path"], app_id, md5=f.get("md5sum", ""),
+                        version_code=int(f.get("vercode") or 0),
+                        version_name=f.get("vername", ""))
 
 
 class Direct(Provider):
@@ -110,9 +131,11 @@ class Direct(Provider):
 
     async def resolve(self, client, app_id):
         check_public_url(app_id)
-        return app_id, ""
+        ext = PurePosixPath(urlparse(app_id).path).suffix.lower()
+        return Resolved(app_id, "", ext if ext in ARCHIVE_EXTS else ".apk")
 
 
+ARCHIVE_EXTS = (".apk", ".xapk", ".apks", ".aab")
 PROVIDERS: dict[str, Provider] = {p.name: p for p in (FDroid(), Aptoide(), Direct())}
 
 
