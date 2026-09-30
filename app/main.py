@@ -15,7 +15,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
 
-from . import __version__, adb, config, emulator, installer, plugins, registry, safety, updates, video
+from . import (__version__, adb, config, emulator, installer, plugins, registry, safety, settings,
+               updates, video, watcher)
 from .jobs import manager
 from .providers import ARCHIVE_EXTS, PROVIDERS, check_public_url, safe_filename
 
@@ -48,6 +49,36 @@ async def ensure_device():
         state["emulator_msg"] = f"emulator failed: {e}"
 
 
+async def watch_loop():
+    """Auto-install new APK downloads from the watched folder (opt-in)."""
+    w = watcher.Watcher(watcher.watch_dir())
+    w.baseline()
+    was_on = False
+    while True:
+        await asyncio.sleep(3)
+        on = bool(settings.load().get("watch"))
+        if on and not was_on:
+            w.baseline()
+        was_on = on
+        if not on:
+            continue
+        for f in w.scan():
+            d = scratch_dir()
+            dest = d / safe_filename(f.name)
+            try:
+                shutil.copy2(f, dest)
+            except OSError:
+                continue
+
+            async def work(job, dest=dest, name=f.name):
+                job.message = f"Installing {name}…"
+                try:
+                    job.results.append({"label": name, **await installer.verify_and_install(dest, None, False)})
+                except Exception as e:
+                    _fail(job, name, e)
+            manager.start("install", f"Install downloaded {f.name}", work)
+
+
 async def background_loop():
     while True:
         try:
@@ -65,7 +96,8 @@ async def background_loop():
 async def lifespan(app):
     config.DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     plugins.load_plugins()
-    tasks = [asyncio.create_task(ensure_device()), asyncio.create_task(background_loop())]
+    tasks = [asyncio.create_task(ensure_device()), asyncio.create_task(background_loop()),
+             asyncio.create_task(watch_loop())]
     yield
     for t in tasks:
         t.cancel()
@@ -158,6 +190,32 @@ async def status():
 @app.get("/api/providers", dependencies=[Depends(auth)])
 async def providers():
     return [n for n in PROVIDERS if n != "direct"] + ["direct"]
+
+
+BROWSE = [("Google Play", "https://play.google.com/store/search?c=apps&q={q}"),
+          ("APKMirror", "https://www.apkmirror.com/?post_type=app_release&searchtype=apk&s={q}"),
+          ("APKPure", "https://apkpure.com/search?q={q}"),
+          ("F-Droid", "https://search.f-droid.org/?q={q}"),
+          ("Aptoide", "https://en.aptoide.com/search?query={q}")]
+
+
+@app.get("/api/browse", dependencies=[Depends(auth)])
+async def browse(q: str = ""):
+    """Search-page links for stores without a public download API. Download in your browser;
+    with the watcher on, the file is installed automatically."""
+    from urllib.parse import quote
+    return [{"name": n, "url": u.format(q=quote(q))} for n, u in BROWSE]
+
+
+@app.get("/api/watch", dependencies=[Depends(auth)])
+async def watch_get():
+    return {"enabled": bool(settings.load().get("watch")), "folder": str(watcher.watch_dir())}
+
+
+@app.post("/api/watch", dependencies=[Depends(auth)])
+async def watch_set(enabled: bool):
+    settings.save(watch=enabled)
+    return await watch_get()
 
 
 @app.get("/api/version", dependencies=[Depends(auth)])

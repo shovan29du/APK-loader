@@ -26,6 +26,9 @@ def main():
         print(hardware.describe())
         return
     if "--setup-emulator" in sys.argv:
+        if "--playstore" in sys.argv:  # image with the real Google Play Store (no root)
+            from app import settings
+            settings.save(playstore=True)
         emulator.setup(lambda m: print("==>", m, flush=True))
         return
 

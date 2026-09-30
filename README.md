@@ -59,6 +59,6 @@ Plugins run with full privileges — only use ones you trust.
 `docker compose up --build` runs redroid + the app on http://localhost:8000 (needs binder/ashmem kernel support).
 
 ## Notes
-- Google Play, APKMirror and APKPure need login or forbid scraping, so they are not built in.
+- **Google Play / APKMirror / APKPure**: no public download API, and scraping them breaks their terms, so there is no built-in downloader. Instead: one-click search links, plus an opt-in *auto-install APKs I download* watcher (Downloads folder, `WATCH_DIR`). For real Google Play, install with `python full_install.py --playstore` (Play Store emulator image; you sign in yourself; app-data backup is unavailable on that image).
 - Only install apps you are licensed to use. Clipboard sync is not implemented (Android has no stable adb clipboard API).
 - Tests: `pytest`.

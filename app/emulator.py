@@ -12,7 +12,7 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
-from . import config, hardware
+from . import config, hardware, settings
 from .util import safe_extract_zip
 
 SDK = config.DATA_DIR / "android-sdk"
@@ -25,6 +25,13 @@ CMDLINE_URL = "https://dl.google.com/android/repository/commandlinetools-{}-1107
 BUNDLETOOL_URL = "https://github.com/google/bundletool/releases/download/1.17.2/bundletool-all-1.17.2.jar"
 LICENSE_URL = "https://developer.android.com/studio/terms"
 OS_TAG = "win" if WIN else "mac" if sys.platform == "darwin" else "linux"
+
+
+def flavor() -> str:
+    """google_apis (rootable: backups work) or google_apis_playstore (real Google Play, no root)."""
+    if os.getenv("EMU_PLAYSTORE") == "1" or settings.load().get("playstore"):
+        return "google_apis_playstore"
+    return "google_apis"
 
 
 def _exe(name: str, bat: bool = False) -> str:
@@ -197,7 +204,7 @@ def setup(log=print, with_bundletool: bool = True):
             shutil.move(str(tmp / "cmdline-tools"), dst)
     log(f"Accepting Android SDK licenses ({LICENSE_URL})…")
     _run([sdkmanager(), f"--sdk_root={SDK}", "--licenses"], "y\n" * 30)
-    image = f"system-images;android-{API_LEVEL};google_apis;{abi()}"
+    image = f"system-images;android-{API_LEVEL};{flavor()};{abi()}"
     log("Installing emulator + system image (large download)…")
     _run([sdkmanager(), f"--sdk_root={SDK}", "platform-tools", "emulator",
           f"build-tools;{API_LEVEL}.0.0", image])

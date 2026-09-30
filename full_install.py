@@ -33,6 +33,7 @@ APP_NAME = "APK Loader"
 SRC = Path(__file__).resolve().parent
 PAYLOAD = ["app", "static", "plugins", "run.py", "requirements.txt", "README.md"]
 REPO = "shovan29du/APK-loader"
+PLAYSTORE = False
 SYSTEM = platform.system()  # Windows / Darwin / Linux
 PT_URL = "https://dl.google.com/android/repository/platform-tools-latest-{}.zip"
 PT_OS = {"Windows": "windows", "Darwin": "darwin", "Linux": "linux"}
@@ -219,7 +220,8 @@ def setup_emulator(dest: Path):
         return say("Android emulator already set up.")
     say("Setting up the Android emulator (Java, SDK, system image, bundletool)…")
     subprocess.run([str(venv_python(dest)), str(dest / "run.py"), "--hardware"], cwd=dest)
-    r = subprocess.run([str(venv_python(dest)), str(dest / "run.py"), "--setup-emulator"], cwd=dest)
+    extra = ["--playstore"] if PLAYSTORE else []
+    r = subprocess.run([str(venv_python(dest)), str(dest / "run.py"), "--setup-emulator", *extra], cwd=dest)
     if r.returncode != 0:
         say("Emulator setup failed. The app still works with your own adb device; "
             "retry later with:  python run.py --setup-emulator")
@@ -293,9 +295,13 @@ def main():
     ap.add_argument("--no-adb", action="store_true")
     ap.add_argument("--no-emulator", action="store_true")
     ap.add_argument("--no-launch", action="store_true")
+    ap.add_argument("--playstore", action="store_true",
+                    help="use the emulator image that includes Google Play (you sign in yourself; no root)")
     ap.add_argument("--update", action="store_true")
     ap.add_argument("--ref", help="branch or tag for --update")
     a = ap.parse_args()
+    global PLAYSTORE
+    PLAYSTORE = a.playstore
     dest = a.dir.expanduser().resolve()
     if a.uninstall:
         uninstall(dest)

@@ -35,6 +35,11 @@ canvas{max-width:100%;max-height:72vh;background:#000;border-radius:8px;touch-ac
   <div id="results"></div>
   <button class="primary" id="installSel">Install selected</button>
   <label><input type="checkbox" id="runLast"> launch last</label>
+  <h3>Other stores (open in your browser)</h3>
+  <div class="row" id="browse" style="flex-wrap:wrap"></div>
+  <label><input type="checkbox" id="watch"> auto-install APKs I download <small id="watchdir"></small></label>
+  <small style="display:block">Google Play, APKMirror and APKPure have no public download API, so download there yourself;
+  with this on, new .apk/.xapk/.apks/.aab files in your Downloads folder are checked and installed automatically.</small>
  </div>
 
  <div class="pane" id="p-url">
@@ -113,6 +118,11 @@ tabs.forEach(([id,l],i)=>{const b=document.createElement('button');b.textContent
   if(id=='apps')loadApps();if(id=='lib')loadLib();if(id=='upd')loadUpd();if(id=='dev'){loadFiles();loadBk()}};$('#tabs').append(b);if(!i)b.click()});
 
 /* ---------- marketplaces / urls ---------- */
+async function loadBrowse(){const l=await j('/api/browse?q='+encodeURIComponent($('#q').value)).catch(()=>[]);
+  $('#browse').innerHTML=l.map(b=>`<a href="${esc(b.url)}" target="_blank" rel="noopener"><button type="button">${esc(b.name)} ↗</button></a>`).join('')}
+$('#q').addEventListener('input',()=>{clearTimeout(window._bt);window._bt=setTimeout(loadBrowse,300)});loadBrowse();
+j('/api/watch').then(w=>{$('#watch').checked=w.enabled;$('#watchdir').textContent='('+w.folder+')'});
+$('#watch').onchange=e=>post('/api/watch?enabled='+e.target.checked).then(w=>say(w.enabled?'Watching '+w.folder:'Watcher off')).catch(err=>say('✘ '+err.message));
 j('/api/providers').then(ps=>ps.filter(p=>p!='direct').forEach(p=>$('#prov').add(new Option(p,p))));
 $('#go').onclick=async()=>{$('#results').textContent='Searching…';
   try{const apps=await j(`/api/search?provider=${$('#prov').value}&q=${encodeURIComponent($('#q').value)}`);

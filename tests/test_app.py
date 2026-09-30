@@ -179,3 +179,19 @@ def test_hardware_profile_for_target_laptop():
     assert r["video_max"] == 1920
     low = hardware.recommend({"ram_mb": 4000, "threads": 4, "nvidia": ""})
     assert low["emu_gpu"] == "swiftshader_indirect" and low["emu_ram_mb"] == 2048
+
+
+def test_watcher_installs_only_new_stable_downloads(tmp_path):
+    from app.watcher import Watcher
+    (tmp_path / "old.apk").write_bytes(b"old")
+    w = Watcher(tmp_path)
+    w.baseline()
+    assert w.scan() == []
+    (tmp_path / "new.apk").write_bytes(b"abc")
+    (tmp_path / "half.apk.crdownload").write_bytes(b"x")
+    (tmp_path / "notes.txt").write_bytes(b"x")
+    assert w.scan() == []                       # first sighting: size not yet confirmed stable
+    (tmp_path / "new.apk").write_bytes(b"abcd")  # still growing
+    assert w.scan() == []
+    assert w.scan() == [tmp_path / "new.apk"]    # unchanged across scans -> ready
+    assert w.scan() == []                        # only once
