@@ -4,6 +4,13 @@ Install APKs on an Android runtime and use the running app from your browser.
 Python (FastAPI) backend drives the device over `adb`; the browser shows a live
 screen stream and sends taps, swipes, keys and text back.
 
+## Install (Windows / macOS / Linux)
+```
+python full_install.py               # install/update + Desktop and OneDrive Desktop shortcuts
+python full_install.py --uninstall   # remove app and shortcuts
+```
+Options: `--dir PATH`, `--no-adb` (skip platform-tools download). Needs Python 3.9+.
+
 ## Run
 ```
 docker compose up --build     # redroid Android + web app
