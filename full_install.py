@@ -16,6 +16,8 @@ NOTE: running the installer with the emulator enabled accepts the Android SDK
 License Agreement on your behalf (https://developer.android.com/studio/terms).
 Use --no-emulator to opt out. The emulator download is roughly 2 GB.
 """
+from __future__ import annotations
+
 import argparse
 import os
 import platform
@@ -159,11 +161,11 @@ def desktop_entry(py: Path, run_py: Path, dest: Path) -> str:
 
 # ---------------------------------------------------------------- install steps
 def check_python():
-    if sys.version_info < (3, 9):
-        sys.exit("Python 3.9+ is required.")
+    if sys.version_info < (3, 10):
+        sys.exit("Python 3.10+ is required (https://www.python.org/downloads/).")
     try:
-        import venv  # noqa: F401
-        import ensurepip  # noqa: F401
+        __import__("venv")
+        __import__("ensurepip")
     except ImportError:
         hint = "sudo apt install python3-venv" if SYSTEM == "Linux" else "reinstall Python with pip/venv"
         sys.exit(f"Python venv support is missing. Try: {hint}")

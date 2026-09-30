@@ -1,16 +1,19 @@
 import asyncio
 import json
 import logging
+import os
+import secrets
 import shutil
 import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import httpx
 from fastapi import (Depends, FastAPI, File, Form, HTTPException, Request,
                      UploadFile, WebSocket, WebSocketDisconnect)
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
@@ -107,9 +110,40 @@ async def lifespan(app):
 app = FastAPI(title="APK Loader", version=__version__, lifespan=lifespan)
 
 
+# Browser-origin protection: without a token the API listens on localhost only, so any web page
+# could otherwise POST to it (CSRF) or reach it via DNS rebinding.
+ALLOWED_HOSTS = {"localhost", "127.0.0.1", "::1"} | {
+    h.strip() for h in os.getenv("APKLOADER_ALLOWED_HOSTS", "").split(",") if h.strip()}
+
+
+def request_allowed(headers, method: str) -> bool:
+    host = headers.get("host", "")
+    if not config.API_TOKEN and (urlsplit("//" + host).hostname or "") not in ALLOWED_HOSTS:
+        return False
+    origin = headers.get("origin")
+    if origin and method not in ("GET", "HEAD", "OPTIONS") and urlsplit(origin).netloc != host:
+        return False
+    if origin and method == "WS" and urlsplit(origin).netloc != host:
+        return False
+    return True
+
+
+@app.middleware("http")
+async def origin_guard(request: Request, call_next):
+    if not request_allowed(request.headers, request.method):
+        return JSONResponse({"detail": "forbidden origin or host"}, status_code=403)
+    return await call_next(request)
+
+
+def token_ok(supplied: str) -> bool:
+    return secrets.compare_digest(supplied.encode(), config.API_TOKEN.encode())
+
+
 async def auth(request: Request):
-    if config.API_TOKEN and request.headers.get("authorization") != f"Bearer {config.API_TOKEN}":
-        raise HTTPException(401, "unauthorized")
+    if config.API_TOKEN:
+        supplied = request.headers.get("authorization", "")
+        if not token_ok(supplied.removeprefix("Bearer ")):
+            raise HTTPException(401, "unauthorized")
 
 
 # ---------- helpers ----------
@@ -318,6 +352,7 @@ async def upload(files: list[UploadFile] = File(...), split: bool = Form(False),
                 out.write(chunk)
         saved.append(dest)
     if split and not all(p.suffix.lower() == ".apk" for p in saved):
+        shutil.rmtree(d, ignore_errors=True)
         raise HTTPException(400, "split mode only takes .apk files")
 
     async def work(job):
@@ -383,11 +418,12 @@ async def copy_from_device(package: str):
     except adb.AdbError as e:
         raise HTTPException(400, str(e))
     files = sorted(tmp.iterdir())
-    cleanup = BackgroundTask(shutil.rmtree, tmp, ignore_errors=True)
     if len(files) == 1:
-        return FileResponse(files[0], filename=f"{package}.apk", background=cleanup)
-    archive = shutil.make_archive(str(tmp / "bundle"), "zip", tmp)
-    return FileResponse(archive, filename=f"{package}.zip", background=cleanup)
+        return FileResponse(files[0], filename=f"{package}.apk",
+                            background=BackgroundTask(shutil.rmtree, tmp, ignore_errors=True))
+    archive = shutil.make_archive(str(tmp.parent / (tmp.name + "_bundle")), "zip", tmp)
+    return FileResponse(archive, filename=f"{package}.zip", background=BackgroundTask(
+        lambda: (shutil.rmtree(tmp, ignore_errors=True), Path(archive).unlink(missing_ok=True))))
 
 
 # ---------- updates ----------
@@ -613,7 +649,8 @@ async def emulator_setup():
 
 @app.websocket("/ws/screen")
 async def screen(ws: WebSocket):
-    if config.API_TOKEN and ws.query_params.get("token") != config.API_TOKEN:
+    if not request_allowed(ws.headers, "WS") or (
+            config.API_TOKEN and not token_ok(ws.query_params.get("token", ""))):
         await ws.close(code=1008)
         return
     await ws.accept()
@@ -657,7 +694,12 @@ async def screen(ws: WebSocket):
     task = asyncio.create_task(pump())
     try:
         while True:
-            m = json.loads(await ws.receive_text())
+            try:
+                m = json.loads(await ws.receive_text())
+                if not isinstance(m, dict):
+                    continue
+            except ValueError:
+                continue
             try:
                 t = m.get("type")
                 # coordinates are fractions (0..1) of the picture, so any stream size works

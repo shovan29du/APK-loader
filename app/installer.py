@@ -1,6 +1,4 @@
 """Install pipeline: verify -> install (apk / bundle / aab) -> record source."""
-import asyncio
-import re
 from pathlib import Path
 
 from . import adb, bundles, registry, safety

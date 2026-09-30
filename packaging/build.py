@@ -38,7 +38,7 @@ def pyinstaller() -> Path:
             "--add-data", f"{ROOT / 'static'}{sep}static",
             "--add-data", f"{ROOT / 'plugins'}{sep}plugins",
             "--collect-submodules", "uvicorn", "--collect-submodules", "app",
-            "--hidden-import", "multipart", "--hidden-import", "httpx",
+            "--hidden-import", "multipart", "--hidden-import", "python_multipart", "--hidden-import", "httpx",
             "--distpath", str(DIST / "pyi"), "--workpath", str(ROOT / "build"),
             "--specpath", str(ROOT / "build")]
     if SYSTEM != "Linux":

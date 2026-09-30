@@ -15,6 +15,8 @@ PORT = int(os.getenv("APKLOADER_PORT", "8000"))
 
 
 def main():
+    if sys.stdout is None:  # windowed (no-console) build: uvicorn logging needs real streams
+        sys.stdout = sys.stderr = open(os.devnull, "w")
     here = os.path.dirname(os.path.abspath(__file__))
     if not getattr(sys, "frozen", False):
         os.chdir(here)
@@ -42,7 +44,8 @@ def main():
                      daemon=True).start()
     import uvicorn
     from app.main import app
-    uvicorn.run(app, host=HOST, port=PORT, log_level="info")
+    uvicorn.run(app, host=HOST, port=PORT, log_level="info",
+                log_config=None if getattr(sys, "frozen", False) else uvicorn.config.LOGGING_CONFIG)
 
 
 if __name__ == "__main__":

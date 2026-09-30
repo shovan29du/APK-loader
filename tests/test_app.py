@@ -6,7 +6,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app import adb, bundles, config, main, safety, video
-from app.providers import Resolved, check_public_url
+from app.providers import check_public_url
 
 
 def make_apk(extra=None):
@@ -51,7 +51,7 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(adb, "device_info", info)
     monkeypatch.setattr(adb, "status", status)
     monkeypatch.setattr(main, "state", {"updates": [], "checked": 0, "emulator_msg": ""})
-    with TestClient(main.app) as c:
+    with TestClient(main.app, base_url="http://localhost") as c:
         c.st = st
         yield c
 
@@ -195,3 +195,67 @@ def test_watcher_installs_only_new_stable_downloads(tmp_path):
     assert w.scan() == []
     assert w.scan() == [tmp_path / "new.apk"]    # unchanged across scans -> ready
     assert w.scan() == []                        # only once
+
+
+def test_csrf_and_dns_rebinding_blocked(client):
+    # cross-site form post (Origin differs from Host)
+    r = client.post("/api/upload", files=[("files", ("a.apk", make_apk()))],
+                    headers={"Origin": "https://evil.example"})
+    assert r.status_code == 403
+    # rebinding: attacker hostname resolving to 127.0.0.1
+    assert client.get("/api/providers", headers={"Host": "evil.example:8000"}).status_code == 403
+    assert client.get("/api/providers").status_code == 200
+
+
+def test_token_required_when_set(client, monkeypatch):
+    monkeypatch.setattr(config, "API_TOKEN", "s3cret")
+    assert client.get("/api/providers").status_code == 401
+    assert client.get("/api/providers", headers={"Authorization": "Bearer s3cret"}).status_code == 200
+
+
+@pytest.fixture
+def fake_adb(monkeypatch, tmp_path):
+    import os
+    import sys
+    script = os.path.join(os.path.dirname(__file__), "fake_adb.py")
+    wrapper = tmp_path / "adb"
+    wrapper.write_text(f"#!/bin/sh\nexec {sys.executable} {script} \"$@\"\n")
+    wrapper.chmod(0o755)
+    monkeypatch.setattr(config, "ADB_BIN", str(wrapper))
+    monkeypatch.setenv("FAKE_ADB_LOG", str(tmp_path / "adb.log"))
+    return tmp_path / "adb.log"
+
+
+def test_real_subprocess_status_and_screenshot(tmp_path, fake_adb, monkeypatch):
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(config, "DOWNLOAD_DIR", tmp_path / "dl")
+    (tmp_path / "dl").mkdir()
+    with TestClient(main.app, base_url="http://localhost") as c:
+        s = c.get("/api/status").json()
+        assert s["connected"] and s["screen"] == {"width": 1080, "height": 2400}
+        assert c.get("/api/screenshot").content.startswith(b"\x89PNG")
+
+
+def test_websocket_h264_stream_and_fractional_taps(tmp_path, fake_adb, monkeypatch):
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(config, "DOWNLOAD_DIR", tmp_path / "dl")
+    (tmp_path / "dl").mkdir()
+    with TestClient(main.app, base_url="http://localhost") as c:
+        with c.websocket_connect("/ws/screen?mode=h264", headers={"host": "localhost"}) as ws:
+            assert ws.receive_json() == {"mode": "h264"}
+            ws.send_text('{"type":"tap","x":0.5,"y":0.25}')
+            nals = [ws.receive_bytes() for _ in range(4)]
+        assert [n[4] & 0x1F for n in nals] == [7, 8, 5, 1]   # SPS, PPS, IDR, P-slice
+        time.sleep(0.3)
+        assert "shell input tap 539 599" in fake_adb.read_text()   # 0.5*1079, 0.25*2399
+
+
+def test_websocket_rejects_foreign_origin(tmp_path, fake_adb, monkeypatch):
+    from starlette.websockets import WebSocketDisconnect
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(config, "DOWNLOAD_DIR", tmp_path / "dl")
+    (tmp_path / "dl").mkdir()
+    with TestClient(main.app, base_url="http://localhost") as c:
+        with pytest.raises(WebSocketDisconnect):
+            with c.websocket_connect("/ws/screen", headers={"host": "localhost", "Origin": "https://evil.example"}) as ws:
+                ws.receive_json()
