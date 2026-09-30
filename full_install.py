@@ -45,8 +45,16 @@ def say(msg):
     print(f"==> {msg}", flush=True)
 
 
+def is_store_python() -> bool:
+    """Microsoft Store Python redirects writes under AppData to a private folder, which breaks
+    virtual environments created there ("failed to locate pyvenv.cfg")."""
+    return SYSTEM == "Windows" and "windowsapps" in (sys.executable + sys.base_prefix).lower()
+
+
 def default_dir() -> Path:
     if SYSTEM == "Windows":
+        if is_store_python():
+            return Path.home() / "APKLoader"     # not under AppData, so not virtualized
         return Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData/Local")) / "APKLoader"
     if SYSTEM == "Darwin":
         return Path.home() / "Library/Application Support/APKLoader"
@@ -185,13 +193,35 @@ def copy_payload(dest: Path):
             shutil.copy2(s, t)
 
 
+def venv_healthy(dest: Path) -> bool:
+    """A usable venv has pyvenv.cfg and an interpreter that actually starts."""
+    py = venv_python(dest)
+    if not (dest / "venv" / "pyvenv.cfg").is_file() or not py.is_file():
+        return False
+    try:
+        return subprocess.run([str(py), "-c", "import sys"], capture_output=True, timeout=60).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def build_venv(dest: Path):
-    if not venv_python(dest).exists():
+    if (dest / "venv").exists() and not venv_healthy(dest):
+        say("Existing virtual environment is broken (an earlier install was interrupted); recreating it…")
+        shutil.rmtree(dest / "venv", ignore_errors=True)
+    if not venv_healthy(dest):
         say("Creating virtual environment…")
-        subprocess.run([sys.executable, "-m", "venv", str(dest / "venv")], check=True)
+        subprocess.run([sys.executable, "-m", "venv", "--clear", str(dest / "venv")], check=True)
+        if not venv_healthy(dest):
+            hint = ("You are using the Microsoft Store build of Python, which cannot create a working environment here. "
+                    "Install Python from https://www.python.org/downloads/ (tick 'Add python.exe to PATH'), "
+                    "then run:  py -3 full_install.py" if is_store_python() else
+                    "The new environment does not start. Try another Python 3.10+, or choose a folder you own with --dir.")
+            sys.exit(f"Could not create a working virtual environment in {dest / 'venv'}.\n{hint}")
     say("Installing dependencies…")
     py = str(venv_python(dest))
-    subprocess.run([py, "-m", "pip", "install", "--quiet", "--upgrade", "pip"], check=True)
+    up = subprocess.run([py, "-m", "pip", "install", "--quiet", "--upgrade", "pip"])
+    if up.returncode != 0:
+        say("Could not upgrade pip (continuing with the bundled version).")
     # Runtime deps only (no test tooling).
     reqs = [l.strip() for l in (dest / "requirements.txt").read_text().splitlines()
             if l.strip() and not l.lower().startswith(("pytest",))]
@@ -236,8 +266,21 @@ def launch(dest: Path):
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kw)
 
 
+def cleanup_old_broken_install(dest: Path):
+    """An earlier run on Store Python left a broken venv under AppData; remove just that venv."""
+    if SYSTEM != "Windows":
+        return
+    old = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData/Local")) / "APKLoader"
+    if old.resolve() != dest.resolve() and (old / "venv").exists() and not venv_healthy(old):
+        say(f"Removing the broken environment left by an earlier attempt: {old / 'venv'}")
+        shutil.rmtree(old / "venv", ignore_errors=True)
+
+
 def install(dest: Path, with_adb: bool, with_emulator: bool = True, do_launch: bool = True):
     check_python()
+    if is_store_python():
+        say("Microsoft Store Python detected: installing outside AppData to avoid its file virtualization.")
+    cleanup_old_broken_install(dest)
     say(f"Installing to {dest}")
     copy_payload(dest)
     build_venv(dest)
