@@ -44,6 +44,15 @@ and BIOS virtualization (setup prints the exact command if acceleration is missi
 - Purges stored APK files older than 7 days.
 
 ## Features
+- **Clipboard sync, audio, true multi-touch** through the official `scrcpy-server` (Genymobile, Apache-2.0). It is downloaded
+  once from the upstream release, verified against a pinned SHA-256, pushed to the device and run with `app_process` (as the
+  `shell` user, like scrcpy itself). Clipboard: the device clipboard flows to the browser automatically, Ctrl+V pastes any
+  Unicode text, or use the Clipboard panel. Audio: press 🔊 (Android 11+; captured only while you listen; note that on real
+  phones scrcpy's capture can mute the phone speaker while active). Pinch: Ctrl+drag, Ctrl+wheel / trackpad pinch, or two fingers on a
+  touchscreen. `SCRCPY=0` disables the helper; *Input → adb only* skips its touch injection.
+- **Scripted tests**: *Scripts* tab — record taps, drags, pinches, typing and keys, then replay at 0.5×–4× and N times.
+  Scripts are JSON (fractional coordinates, so they work at any resolution) and can be edited, exported and imported. Add
+  `launch`, `wait`, `assert_focus` and `screenshot` steps to turn a recording into a pass/fail test with a report and screenshots.
 - **Responsive input**: one persistent `adb shell` per device (no process per tap) and, when the touchscreen node is writable,
   real-time press/drag/release via raw touch events (falls back to `input` for rotated screens). Click the screen, then type;
   Ctrl+V pastes text; the mouse wheel scrolls.
@@ -75,5 +84,6 @@ Plugins run with full privileges — only use ones you trust.
 
 ## Notes
 - **Google Play / APKMirror / APKPure**: no public download API, and scraping them breaks their terms, so there is no built-in downloader. Instead: one-click search links, plus an opt-in *auto-install APKs I download* watcher (Downloads folder, `WATCH_DIR`). For real Google Play, install with `python full_install.py --playstore` (Play Store emulator image; you sign in yourself; app-data backup is unavailable on that image).
-- Only install apps you are licensed to use. Clipboard sync is not implemented (Android has no stable adb clipboard API).
+- scrcpy-server is © Genymobile and is downloaded from its official release, not redistributed here. The client speaks scrcpy protocol 4.0 and the version must match exactly.
+- Only install apps you are licensed to use.
 - Tests: `pytest`.

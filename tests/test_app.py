@@ -1,3 +1,5 @@
+import asyncio
+import json
 import io
 import time
 import zipfile
@@ -17,6 +19,12 @@ def make_apk(extra=None):
         for k, v in (extra or {}).items():
             z.writestr(k, v)
     return b.getvalue()
+
+
+@pytest.fixture(autouse=True)
+def _no_scrcpy_network(monkeypatch):
+    """Tests never download or start the real scrcpy-server (they use fake_scrcpy instead)."""
+    monkeypatch.setattr(config, "SCRCPY", False)
 
 
 @pytest.fixture
@@ -248,7 +256,11 @@ def test_websocket_h264_stream_and_fractional_taps(tmp_path, fake_adb, monkeypat
         with c.websocket_connect("/ws/screen?mode=h264", headers={"host": "localhost"}) as ws:
             assert ws.receive_json() == {"mode": "h264"}
             ws.send_text('{"type":"tap","x":0.5,"y":0.25}')
-            nals = [ws.receive_bytes() for _ in range(4)]
+            nals = []
+            while len(nals) < 4:                     # skip helper status messages (text) between frames
+                msg = ws.receive()
+                if msg.get("bytes"):
+                    nals.append(msg["bytes"])
         assert [n[4] & 0x1F for n in nals] == [7, 8, 5, 1]   # SPS, PPS, IDR, P-slice
         time.sleep(0.3)
         assert "stdin: input tap 539 599" in fake_adb.read_text()   # 0.5*1079, 0.25*2399
@@ -427,3 +439,356 @@ def test_history_records_update_with_snapshot_and_retry(client, monkeypatch):
     assert r.status_code == 200 and wait_job(client, r.json()["job"])["status"] == "done"
     assert len(client.get("/api/history").json()) == 2
     assert client.delete(f"/api/history/{h[0]['id']}").status_code == 200
+
+
+# ---------------- scrcpy client (protocol v4.0) ----------------
+def test_scrcpy_wire_sizes_match_server_reader():
+    from app import scrcpy
+    assert len(scrcpy.msg_touch(0, 100, 1, 2, 1080, 2400)) == 32     # 1+1+8+12+2+4+4
+    assert len(scrcpy.msg_scroll(1, 2, 1080, 2400, 0, 1)) == 21
+    m = scrcpy.msg_set_clipboard(7, "héllo", True)
+    assert m[0] == 9 and m[1:9] == (7).to_bytes(8, "big") and m[9] == 1 and m[10:14] == (6).to_bytes(4, "big")
+    assert m[14:] == "héllo".encode()
+    assert scrcpy.msg_get_clipboard() == b"\x08\x00"
+    # pressure: 1.0 -> 0xFFFF, 0 -> 0
+    assert scrcpy.msg_touch(0, 1, 0, 0, 1, 1, 1.0)[-10:-8] == b"\xff\xff"
+    assert scrcpy.msg_touch(1, 1, 0, 0, 1, 1, 0.0)[-10:-8] == b"\x00\x00"
+
+
+def test_scrcpy_jar_hash_is_pinned():
+    from app import scrcpy
+    assert len(scrcpy.SHA256) == 64 and scrcpy.VERSION in scrcpy.URL
+
+
+@pytest.mark.asyncio
+async def test_scrcpy_session_handshake_clipboard_touch_audio():
+    from app import scrcpy
+    from tests.fake_scrcpy import FakeScrcpyServer
+    srv = await FakeScrcpyServer(audio=True).start()
+    s = scrcpy.Session("emulator-5554", audio=True)
+    clips, pcm = [], []
+    s.clip_listeners.append(clips.append)
+    s.audio_listeners.append(pcm.append)
+    try:
+        await s.handshake("127.0.0.1", srv.port)
+        await asyncio.sleep(0.2)
+        assert s.control_ok and s.audio_ok and srv.conns == 2
+        assert pcm[:3] == [bytes([0]) * 8, bytes([1]) * 8, bytes([2]) * 8]     # config packet skipped
+        # two fingers (pinch), scroll, clipboard both ways
+        await s.touch(scrcpy.ACT_DOWN, 0, 0.5, 0.5, 1080, 2400)
+        await s.touch(scrcpy.ACT_DOWN, 1, 0.25, 0.75, 1080, 2400)
+        await s.touch(scrcpy.ACT_UP, 1, 0.25, 0.75, 1080, 2400)
+        await s.scroll(0.5, 0.5, 1080, 2400, 1.0)
+        await s.set_clipboard("héllo wörld", paste=True)
+        await s.get_clipboard()
+        await srv.push_clipboard("copied on device")
+        await asyncio.sleep(0.3)
+    finally:
+        await s.stop()
+        await srv.close()
+    kinds = [r[0] for r in srv.received]
+    assert kinds == ["touch", "touch", "touch", "scroll", "set_clipboard", "get_clipboard"]
+    t0, t1, t2 = srv.received[:3]
+    assert t0[1:4] == (0, 100, 539) and t1[2] == 101 and t2[1] == 1 and t2[7] == 0    # two pointer ids; UP has pressure 0
+    assert t0[5:7] == (1080, 2400)
+    assert srv.received[4] == ("set_clipboard", 1, True, "héllo wörld")
+    assert sorted(clips) == ["copied on device", "hello"]
+
+
+@pytest.mark.asyncio
+async def test_scrcpy_control_only_uses_first_socket_for_control():
+    from app import scrcpy
+    from tests.fake_scrcpy import FakeScrcpyServer
+    srv = await FakeScrcpyServer(audio=False).start()
+    s = scrcpy.Session("emulator-5554", audio=False)
+    try:
+        await s.handshake("127.0.0.1", srv.port)
+        await s.set_clipboard("x")
+        await asyncio.sleep(0.1)
+        assert srv.conns == 1 and s.control_ok and not s.audio_ok
+    finally:
+        await s.stop()
+        await srv.close()
+    assert srv.received == [("set_clipboard", 1, False, "x")]
+
+
+@pytest.mark.asyncio
+async def test_scrcpy_audio_unavailable_keeps_control():
+    from app import scrcpy
+    from tests.fake_scrcpy import FakeScrcpyServer
+    srv = await FakeScrcpyServer(audio=True, audio_codec=0).start()     # server says "audio disabled"
+    s = scrcpy.Session("emulator-5554", audio=True)
+    try:
+        await s.handshake("127.0.0.1", srv.port)
+        await asyncio.sleep(0.2)
+        assert s.control_ok and not s.audio_ok
+    finally:
+        await s.stop()
+        await srv.close()
+
+
+# ---------------- multi-touch / pinch ----------------
+def _rc_with_evdev():
+    from app.remote import RemoteControl
+    rc = RemoteControl()
+    rc.w, rc.h = 1080, 2400
+    rc.evdev = {"dev": "/dev/input/event2", "maxx": 32767, "maxy": 32767}
+    return rc
+
+
+@pytest.mark.asyncio
+async def test_pinch_over_evdev_uses_two_slots_and_one_btn_touch(monkeypatch):
+    sent = []
+
+    async def fire(cmd):
+        sent.append(cmd)
+    monkeypatch.setattr(adb, "fire", fire)
+    rc = _rc_with_evdev()
+    await rc.pinch(0.5, 0.5, 2.0)
+    slots = [l for l in sent if "3 47 1" in l]
+    assert slots and any("3 47 0" in l for l in sent)                # both fingers used
+    assert sum("1 330 1" in l for l in sent) == 1                    # BTN_TOUCH down once (first finger)
+    assert sum("1 330 0" in l for l in sent) == 1                    # ...and up once (last finger)
+    downs = [l for l in sent if "3 57 " in l and "3 57 -1" not in l]
+    assert len({l.split("3 57 ")[1].split(";")[0] for l in downs}) == 2     # distinct tracking ids
+    xs = [int(l.split("3 53 ")[1].split(";")[0]) for l in sent if "3 47 0" in l and "3 53 " in l]
+    assert xs[-1] < xs[0]                                              # zoom in: the left finger moves further left
+
+
+@pytest.mark.asyncio
+async def test_pinch_zoom_in_spreads_zoom_out_closes(monkeypatch):
+    sent = []
+
+    async def fire(cmd):
+        sent.append(cmd)
+    monkeypatch.setattr(adb, "fire", fire)
+
+    def spread(cmds):
+        f0 = [int(c.split("3 53 ")[1].split(";")[0]) for c in cmds if "3 47 0" in c and "3 53 " in c]
+        f1 = [int(c.split("3 53 ")[1].split(";")[0]) for c in cmds if "3 47 1" in c and "3 53 " in c]
+        return f1[-1] - f0[-1], f1[0] - f0[0]
+    rc = _rc_with_evdev()
+    await rc.pinch(0.5, 0.5, 2.0)
+    end, start = spread(sent)
+    assert end > start
+    sent.clear()
+    await rc.pinch(0.5, 0.5, 0.5)
+    end, start = spread(sent)
+    assert end < start
+
+
+@pytest.mark.asyncio
+async def test_pinch_without_multitouch_engine_is_refused():
+    from app.remote import RemoteControl
+    rc = RemoteControl()
+    with pytest.raises(adb.AdbError):
+        await rc.pinch(0.5, 0.5, 2.0)
+
+
+@pytest.mark.asyncio
+async def test_remote_routes_touch_through_scrcpy_when_available(monkeypatch):
+    from app import scrcpy
+    from app.remote import RemoteControl
+    from tests.fake_scrcpy import FakeScrcpyServer
+    srv = await FakeScrcpyServer(audio=False).start()
+    s = scrcpy.Session(adb.serial(), audio=False)
+    await s.handshake("127.0.0.1", srv.port)
+    scrcpy.manager.sessions[adb.serial()] = s
+    try:
+        rc = RemoteControl()
+        rc.w, rc.h = 2400, 1080                                       # landscape app: sizes follow the rotation
+        await rc.pinch(0.5, 0.5, 2.0)
+        await rc.handle({"type": "clip_set", "text": "ünï", "paste": True})
+        await asyncio.sleep(0.2)
+        touches = [r for r in srv.received if r[0] == "touch"]
+        assert {t[2] for t in touches} == {100, 101} and all(t[5:7] == (2400, 1080) for t in touches)
+        assert srv.received[-1] == ("set_clipboard", 1, True, "ünï")
+        rc.engine = "adb"                                              # user forced the adb engine
+        assert rc.scrcpy() is None
+    finally:
+        scrcpy.manager.sessions.pop(adb.serial(), None)
+        await s.stop()
+        await srv.close()
+
+
+# ---------------- scripted tests ----------------
+def test_script_validation_rejects_bad_steps():
+    from app import scripts
+    ok = scripts.validate({"name": "t", "steps": [{"type": "tap", "x": 0.5, "y": 0.5}, {"type": "key", "key": "KEYCODE_BACK"}]})
+    assert len(ok["steps"]) == 2
+    for bad in ({"type": "tap", "x": 2, "y": 0.5}, {"type": "key", "key": "BACK; rm -rf /"},
+                {"type": "launch", "package": "x; reboot"}, {"type": "exec", "cmd": "id"},
+                {"type": "text", "text": "x" * 301}, {"type": "touch", "phase": "sideways", "x": 0, "y": 0}):
+        with pytest.raises(scripts.ScriptError):
+            scripts.validate({"name": "t", "steps": [bad]})
+    with pytest.raises(scripts.ScriptError):
+        scripts.validate({"name": "../evil", "steps": []})
+
+
+def test_record_and_play_script_end_to_end(tmp_path, fake_adb, monkeypatch):
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(config, "DOWNLOAD_DIR", tmp_path / "dl")
+    (tmp_path / "dl").mkdir()
+    with TestClient(main.app, base_url="http://localhost") as c:
+        assert c.post("/api/scripts/record/start", json={"name": "login flow"}).status_code == 200
+        with c.websocket_connect("/ws/screen?mode=png", headers={"host": "localhost"}) as ws:
+            ws.receive_json()
+            time.sleep(0.6)
+            for phase in ("down", "move", "up"):
+                ws.send_text('{"type":"touch","phase":"%s","x":0.5,"y":0.4}' % phase)
+            ws.send_text('{"type":"text","text":"user1"}')
+            ws.send_text('{"type":"key","key":"KEYCODE_ENTER"}')
+            ws.send_text('{"type":"bogus"}')
+            time.sleep(0.4)
+        saved = c.post("/api/scripts/record/stop").json()
+        assert [s["type"] for s in saved["steps"]] == ["touch", "touch", "touch", "text", "key"]   # bogus not recorded
+        assert saved["steps"][0]["t"] <= saved["steps"][-1]["t"]
+        assert c.get("/api/scripts").json()["scripts"][0]["name"] == "login flow"
+
+        # add test steps via the editor endpoint, then run it twice
+        steps = saved["steps"] + [{"type": "launch", "package": "com.example.app"},
+                                  {"type": "assert_focus", "package": "com.example.app", "timeout": 2},
+                                  {"type": "screenshot", "name": "after"}]
+        assert c.put("/api/scripts/login flow", json={"steps": steps}).status_code == 200
+        r = c.post("/api/scripts/login flow/run", json={"speed": 10, "loops": 2})
+        job = wait_job(c, r.json()["job"], timeout=20)
+        assert job["status"] == "done" and len(job["results"]) == 2 and all(x["ok"] for x in job["results"])
+        runs = c.get("/api/scripts/runs").json()
+        assert runs[0]["ok"] and runs[0]["screenshots"]
+        assert c.get(f"/api/scripts/runs/{runs[0]['id']}/{runs[0]['screenshots'][0]}").content.startswith(b"\x89PNG")
+        assert c.get(f"/api/scripts/runs/{runs[0]['id']}/..%2Freport.json").status_code in (404, 422)
+        log = fake_adb.read_text()
+        assert "stdin: input text user1" in log and "KEYCODE_ENTER" in log
+
+
+def test_failed_assertion_fails_the_run_and_stops(tmp_path, fake_adb, monkeypatch):
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(config, "DOWNLOAD_DIR", tmp_path / "dl")
+    (tmp_path / "dl").mkdir()
+    with TestClient(main.app, base_url="http://localhost") as c:
+        steps = [{"type": "assert_focus", "package": "com.other.app", "timeout": 0.6},
+                 {"type": "key", "key": "KEYCODE_HOME"}]
+        assert c.put("/api/scripts/bad", json={"steps": steps}).status_code == 200
+        job = wait_job(c, c.post("/api/scripts/bad/run", json={}).json()["job"], timeout=20)
+        assert job["status"] == "error" and "com.other.app" in job["results"][0]["error"]
+        assert "KEYCODE_HOME" not in fake_adb.read_text()             # aborted after the failed assertion
+        assert c.put("/api/scripts/x", json={"steps": [{"type": "exec"}]}).status_code == 400
+        assert c.get("/api/scripts/..%2F..%2Fetc").status_code in (400, 404)
+
+
+def test_running_job_can_be_cancelled(tmp_path, fake_adb, monkeypatch):
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(config, "DOWNLOAD_DIR", tmp_path / "dl")
+    (tmp_path / "dl").mkdir()
+    with TestClient(main.app, base_url="http://localhost") as c:
+        c.put("/api/scripts/slow", json={"steps": [{"type": "wait", "seconds": 60}]})
+        jid = c.post("/api/scripts/slow/run", json={"speed": 1}).json()["job"]
+        time.sleep(0.4)
+        assert c.post(f"/api/jobs/{jid}/cancel").status_code == 200
+        job = wait_job(c, jid, timeout=5)
+        assert job["status"] == "error" and job["message"] == "cancelled"
+
+
+# ---------------- scrcpy helper through the whole stack ----------------
+import threading  # noqa: E402
+
+
+class ThreadedFakeScrcpy:
+    """FakeScrcpyServer on its own event loop/thread, so TestClient's loop can talk to it."""
+
+    def __init__(self, **kw):
+        from tests.fake_scrcpy import FakeScrcpyServer
+        self.loop = asyncio.new_event_loop()
+        self.thread = threading.Thread(target=self.loop.run_forever, daemon=True)
+        self.thread.start()
+        self.srv = FakeScrcpyServer(**kw)
+        asyncio.run_coroutine_threadsafe(self.srv.start(), self.loop).result(5)
+
+    @property
+    def port(self):
+        return self.srv.port
+
+    def push_clipboard(self, text):
+        asyncio.run_coroutine_threadsafe(self.srv.push_clipboard(text), self.loop).result(5)
+
+    def close(self):
+        asyncio.run_coroutine_threadsafe(self.srv.close(), self.loop).result(5)
+        self.loop.call_soon_threadsafe(self.loop.stop)
+
+
+@pytest.fixture
+def helper_env(tmp_path, fake_adb, monkeypatch):
+    from app import scrcpy
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(config, "DOWNLOAD_DIR", tmp_path / "dl")
+    (tmp_path / "dl").mkdir()
+    monkeypatch.setattr(config, "SCRCPY", True)
+    monkeypatch.setattr(scrcpy, "jar_ready", lambda: True)
+    yield tmp_path
+    scrcpy.manager.sessions.clear()
+    scrcpy.manager.refs.clear()
+
+
+def test_helper_clipboard_and_pinch_over_websocket(helper_env, fake_adb, monkeypatch):
+    fake = ThreadedFakeScrcpy(audio=False)
+    monkeypatch.setenv("FAKE_SCRCPY_PORT", str(fake.port))
+    try:
+        with TestClient(main.app, base_url="http://localhost") as c:
+            with c.websocket_connect("/ws/screen?mode=png", headers={"host": "localhost"}) as ws:
+                seen = {}
+                end = time.time() + 10
+                while "helper" not in seen and time.time() < end:
+                    msg = ws.receive()
+                    if msg.get("text"):
+                        seen.update(json.loads(msg["text"]))
+                assert seen.get("helper") is True
+                ws.send_text(json.dumps({"type": "clip_set", "text": "grüße", "paste": True}))
+                ws.send_text(json.dumps({"type": "pinch", "x": 0.5, "y": 0.5, "scale": 2}))
+                fake.push_clipboard("from the phone")
+                got = None
+                end = time.time() + 5
+                while got is None and time.time() < end:
+                    msg = ws.receive()
+                    if msg.get("text") and "clipboard" in json.loads(msg["text"]):
+                        got = json.loads(msg["text"])["clipboard"]
+                assert got == "from the phone"
+                time.sleep(0.5)
+            assert c.get("/api/status").json()["scrcpy"]["control"] in (True, False)
+        kinds = [r[0] for r in fake.srv.received]
+        assert ("set_clipboard", 1, True, "grüße") in fake.srv.received
+        touches = [r for r in fake.srv.received if r[0] == "touch"]
+        assert kinds.count("touch") >= 20 and {t[2] for t in touches} == {100, 101}
+        assert [t[1] for t in touches if t[1] != 2] == [0, 0, 1, 1]        # 2 downs then 2 ups (moves are action 2)
+        assert "push" in fake_adb.read_text() and "forward tcp:0" in fake_adb.read_text()
+        assert "forward --remove" in fake_adb.read_text()                   # tunnel removed on disconnect
+    finally:
+        fake.close()
+
+
+def test_audio_websocket_streams_pcm(helper_env, fake_adb, monkeypatch):
+    fake = ThreadedFakeScrcpy(audio=True, pcm_packets=3)
+    monkeypatch.setenv("FAKE_SCRCPY_PORT", str(fake.port))
+    try:
+        with TestClient(main.app, base_url="http://localhost") as c:
+            with c.websocket_connect("/ws/audio", headers={"host": "localhost"}) as ws:
+                meta = ws.receive_json()
+                assert meta == {"format": "s16le", "rate": 48000, "channels": 2}
+                chunks = []
+                end = time.time() + 6
+                while not chunks and time.time() < end:
+                    msg = ws.receive()
+                    if msg.get("bytes"):
+                        chunks.append(msg["bytes"])
+                assert chunks and set(chunks[0]) <= {0, 1, 2, 7}           # real PCM payload; config packet skipped
+                assert len(chunks[0]) % 4 == 0                              # whole stereo s16 frames
+    finally:
+        fake.close()
+
+
+def test_audio_needs_helper_message_when_disabled(tmp_path, fake_adb, monkeypatch):
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(config, "DOWNLOAD_DIR", tmp_path / "dl")
+    (tmp_path / "dl").mkdir()
+    with TestClient(main.app, base_url="http://localhost") as c:       # SCRCPY=False (autouse fixture)
+        with c.websocket_connect("/ws/audio", headers={"host": "localhost"}) as ws:
+            assert "scrcpy helper" in ws.receive_json()["error"]

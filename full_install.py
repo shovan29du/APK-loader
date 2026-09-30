@@ -246,6 +246,10 @@ def install(dest: Path, with_adb: bool, with_emulator: bool = True, do_launch: b
             install_adb(dest)
         except Exception as e:
             say(f"adb download failed ({e}). Install Android platform-tools manually.")
+    say("Downloading the scrcpy helper (clipboard, audio, multi-touch)…")
+    r = subprocess.run([str(venv_python(dest)), str(dest / "run.py"), "--setup-helper"], cwd=dest)
+    if r.returncode != 0:
+        say("Helper download failed; it is fetched again on first use (features fall back meanwhile).")
     if with_emulator:
         setup_emulator(dest)
     shortcuts = make_shortcuts(dest)

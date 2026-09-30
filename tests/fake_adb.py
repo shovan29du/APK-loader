@@ -16,6 +16,17 @@ if log:
     with open(log, "a") as f:
         f.write(" ".join(a) + "\n")
 out = sys.stdout.buffer
+if a[:1] == ["push"]:
+    print("1 file pushed")
+    sys.exit(0)
+if a[:2] == ["forward", "tcp:0"]:
+    print(os.environ.get("FAKE_SCRCPY_PORT", "0"))
+    sys.exit(0)
+if a[:1] == ["forward"]:
+    sys.exit(0)
+if a[:1] == ["shell"] and len(a) == 2 and a[1].startswith("CLASSPATH="):   # scrcpy-server "running"
+    time.sleep(600)
+    sys.exit(0)
 if a == ["shell"]:                      # persistent shell: log every stdin line
     for line in sys.stdin:
         if log:
@@ -32,6 +43,8 @@ elif a[:1] == ["connect"] or a[:1] == ["get-state"]:
     print("device")
 elif a[:2] == ["shell", "dumpsys window displays | grep -m1 'cur='"]:
     print("  init=1080x2400 420dpi cur=1080x2400 app=1080x2400 rng=1080x1008-2400x2328")
+elif a[:2] == ["shell", "dumpsys window | grep -E 'mCurrentFocus|mFocusedApp' | head -3"]:
+    print("  mCurrentFocus=Window{1a2b u0 com.example.app/com.example.app.MainActivity}")
 elif a[:2] == ["shell", "getevent"]:
     print('add device 1: /dev/input/event2\n  name:     "virtio_input_multi_touch_1"\n  events:\n    ABS (0003): ABS_MT_SLOT : value 0, min 0, max 9, fuzz 0\n'
           '                ABS_MT_POSITION_X : value 0, min 0, max 32767, fuzz 0, flat 0, resolution 0\n'

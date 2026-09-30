@@ -34,19 +34,25 @@ def _ev(dev: str, t: int, c: int, v: int) -> str:
     return f"sendevent {dev} {t} {c} {v}"
 
 
-def touch_command(info: dict, phase: str, nx: float, ny: float, tid: int) -> str:
-    """Shell line for one touch phase (down|move|up) at fractional position (nx, ny)."""
+def touch_command(info: dict, phase: str, nx: float, ny: float, tid: int,
+                  slot: int = 0, first: bool = True, last: bool = True) -> str:
+    """Shell line for one touch phase (down|move|up) of finger `slot` at fractional (nx, ny).
+    `first`/`last`: this is the first finger down / the last finger up (BTN_TOUCH toggles then)."""
     d = info["dev"]
     x = int(min(max(nx, 0.0), 1.0) * info["maxx"])
     y = int(min(max(ny, 0.0), 1.0) * info["maxy"])
-    ev = [_ev(d, EV_ABS, ABS_MT_SLOT, 0)]
+    ev = [_ev(d, EV_ABS, ABS_MT_SLOT, slot)]
     if phase == "down":
         ev += [_ev(d, EV_ABS, ABS_MT_TRACKING_ID, tid), _ev(d, EV_ABS, ABS_MT_POSITION_X, x),
-               _ev(d, EV_ABS, ABS_MT_POSITION_Y, y), _ev(d, EV_KEY, BTN_TOUCH, 1)]
+               _ev(d, EV_ABS, ABS_MT_POSITION_Y, y)]
+        if first:
+            ev.append(_ev(d, EV_KEY, BTN_TOUCH, 1))
     elif phase == "move":
         ev += [_ev(d, EV_ABS, ABS_MT_POSITION_X, x), _ev(d, EV_ABS, ABS_MT_POSITION_Y, y)]
     elif phase == "up":
-        ev += [_ev(d, EV_ABS, ABS_MT_TRACKING_ID, -1), _ev(d, EV_KEY, BTN_TOUCH, 0)]
+        ev.append(_ev(d, EV_ABS, ABS_MT_TRACKING_ID, -1))
+        if last:
+            ev.append(_ev(d, EV_KEY, BTN_TOUCH, 0))
     else:
         raise adb.AdbError("bad touch phase")
     ev.append(_ev(d, EV_SYN, 0, 0))

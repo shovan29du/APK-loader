@@ -26,6 +26,7 @@ class JobManager:
         self.jobs: dict[str, Job] = {}
         self._sem: asyncio.Semaphore | None = None
         self._tasks: set = set()
+        self._by_id: dict[str, asyncio.Task] = {}
 
     def start(self, kind: str, title: str, work, serial: bool = True) -> Job:
         """work: async fn(job). serial=True queues behind other device jobs."""
@@ -44,13 +45,23 @@ class JobManager:
                         await self._run(job, work)
                 else:
                     await self._run(job, work)
+            except asyncio.CancelledError:
+                job.status, job.message = "error", "cancelled"
             except Exception as e:  # never leave a job stuck
                 job.status, job.message = "error", str(e)
 
         t = asyncio.create_task(runner())
         self._tasks.add(t)
-        t.add_done_callback(self._tasks.discard)
+        self._by_id[job.id] = t
+        t.add_done_callback(lambda _t, jid=job.id: (self._tasks.discard(_t), self._by_id.pop(jid, None)))
         return job
+
+    def cancel(self, job_id: str) -> bool:
+        t = self._by_id.get(job_id)
+        if t and not t.done():
+            t.cancel()
+            return True
+        return False
 
     async def _run(self, job: Job, work):
         job.status = "running"

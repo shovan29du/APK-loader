@@ -19,7 +19,8 @@ from pydantic import BaseModel
 from starlette.background import BackgroundTask
 
 from . import (__version__, adb, config, devices, emulator, history, inputs, installer, plugins, registry,
-               safety, settings, updates, video, watcher)
+               safety, scripts, scrcpy, settings, updates, video, watcher)
+from .remote import RemoteControl
 from .jobs import manager
 from .providers import ARCHIVE_EXTS, PROVIDERS, check_public_url, safe_filename
 
@@ -87,6 +88,7 @@ async def background_loop():
         try:
             purge_old_downloads()
             history.purge_old_rollbacks()
+            scripts.purge_old_runs()
             if (await adb.status())["connected"]:
                 state["updates"] = await updates.app_updates()
                 state["checked"] = time.time()
@@ -106,6 +108,7 @@ async def lifespan(app):
     for t in tasks:
         t.cancel()
     adb.close_channels()
+    await scrcpy.manager.stop_all()
     for c in list(emulator.controllers.values()):
         await asyncio.to_thread(c.stop)
 
@@ -226,6 +229,9 @@ async def status():
                      "message": state["emulator_msg"]}
     s["version"] = __version__
     s["evdev"] = bool(await inputs.touch_info()) if s.get("connected") else False
+    live = scrcpy.manager.sessions.get(adb.serial())
+    s["scrcpy"] = {"enabled": config.SCRCPY, "downloaded": scrcpy.jar_ready(),
+                   "control": bool(live and live.control_ok), "audio": bool(live and live.audio_ok)}
     return s
 
 
@@ -290,6 +296,13 @@ async def job(job_id: str):
     if not j:
         raise HTTPException(404, "no such job")
     return j.dict()
+
+
+@app.post("/api/jobs/{job_id}/cancel", dependencies=[Depends(auth)])
+async def job_cancel(job_id: str):
+    if not manager.cancel(job_id):
+        raise HTTPException(404, "no running job with that id")
+    return {"ok": True}
 
 
 def _install_job(items: list[Item], run_last: bool, allow_unsafe: bool):
@@ -920,7 +933,153 @@ async def history_delete(entry_id: str):
     return {"ok": True}
 
 
-# ---------- live screen (H.264 via WebCodecs, PNG fallback) + low-latency input ----------
+# ---------- scrcpy helper: setup / clipboard / audio ----------
+
+@app.post("/api/scrcpy/setup", dependencies=[Depends(auth)])
+async def scrcpy_setup():
+    """Download the pinned scrcpy-server (used for clipboard sync, audio and multi-touch)."""
+    async def work(job):
+        job.message = "Downloading scrcpy-server…"
+        await asyncio.to_thread(scrcpy.fetch_server, lambda m: None)
+        job.results.append({"ok": True, "label": f"scrcpy-server v{scrcpy.VERSION}"})
+        job.message = ""
+    return {"job": manager.start("setup", "Download scrcpy helper", work, serial=False).id}
+
+
+@app.websocket("/ws/audio")
+async def audio_ws(ws: WebSocket):
+    """Raw PCM (s16le, 48 kHz, stereo) from the device. Captured only while a client listens."""
+    if not request_allowed(ws.headers, "WS") or (
+            config.API_TOKEN and not token_ok(ws.query_params.get("token", ""))):
+        await ws.close(code=1008)
+        return
+    await ws.accept()
+    try:
+        adb.use_serial(ws.query_params.get("device"))
+    except adb.AdbError:
+        await ws.close(code=1008)
+        return
+    serial = adb.serial()
+    queue: asyncio.Queue = asyncio.Queue(maxsize=50)
+    push = lambda data: queue.put_nowait(data) if not queue.full() else None  # noqa: E731  drop when slow
+    session = await scrcpy.manager.acquire(serial, audio=True)
+    try:
+        if not session:
+            await ws.send_text(json.dumps({"error": "audio needs the scrcpy helper (downloads on first use)"}))
+            return
+        session.audio_listeners.append(push)
+        await ws.send_text(json.dumps({"format": "s16le", "rate": scrcpy.SAMPLE_RATE, "channels": scrcpy.CHANNELS}))
+        warned = False
+        while True:
+            try:
+                await ws.send_bytes(await asyncio.wait_for(queue.get(), 2))
+            except asyncio.TimeoutError:
+                if not session.control_ok:
+                    break
+                if not session.audio_ok and not warned:
+                    warned = True
+                    await ws.send_text(json.dumps({"error": "device audio unavailable (needs Android 11+)"}))
+    except (WebSocketDisconnect, RuntimeError):
+        pass
+    finally:
+        if session and push in session.audio_listeners:
+            session.audio_listeners.remove(push)
+        await scrcpy.manager.release(serial, audio=True)
+
+
+# ---------- scripted tests ----------
+
+class ScriptBody(BaseModel):
+    name: str | None = None
+    steps: list[dict]
+
+
+class RecStart(BaseModel):
+    name: str
+
+
+class RunReq(BaseModel):
+    speed: float = 1.0
+    loops: int = 1
+
+
+def _script_err(e: Exception):
+    return HTTPException(400, str(e))
+
+
+@app.get("/api/scripts", dependencies=[Depends(auth)])
+async def scripts_list():
+    return {"scripts": scripts.list_scripts(), "recording": scripts.recorder.recording(adb.serial())}
+
+
+@app.post("/api/scripts/record/start", dependencies=[Depends(auth)])
+async def scripts_record_start(r: RecStart):
+    try:
+        scripts.recorder.start(adb.serial(), r.name)
+    except scripts.ScriptError as e:
+        raise _script_err(e)
+    return scripts.recorder.recording(adb.serial())
+
+
+@app.post("/api/scripts/record/stop", dependencies=[Depends(auth)])
+async def scripts_record_stop():
+    try:
+        return scripts.recorder.stop(adb.serial())
+    except scripts.ScriptError as e:
+        raise _script_err(e)
+
+
+@app.get("/api/scripts/runs", dependencies=[Depends(auth)])
+async def scripts_runs():
+    return scripts.list_runs()
+
+
+@app.get("/api/scripts/runs/{run_id}/{name}", dependencies=[Depends(auth)])
+async def scripts_run_file(run_id: str, name: str):
+    f = scripts.run_file(run_id, name)
+    if not f:
+        raise HTTPException(404, "not found")
+    return FileResponse(f)
+
+
+@app.get("/api/scripts/{name}", dependencies=[Depends(auth)])
+async def scripts_get(name: str):
+    try:
+        return scripts.load(name)
+    except scripts.ScriptError as e:
+        raise _script_err(e)
+
+
+@app.put("/api/scripts/{name}", dependencies=[Depends(auth)])
+async def scripts_put(name: str, body: ScriptBody):
+    try:
+        return scripts.save({"name": name, "steps": body.steps})
+    except scripts.ScriptError as e:
+        raise _script_err(e)
+
+
+@app.delete("/api/scripts/{name}", dependencies=[Depends(auth)])
+async def scripts_delete(name: str):
+    try:
+        scripts.delete(name)
+    except scripts.ScriptError as e:
+        raise _script_err(e)
+    return {"ok": True}
+
+
+@app.post("/api/scripts/{name}/run", dependencies=[Depends(auth)])
+async def scripts_run(name: str, r: RunReq):
+    try:
+        script = scripts.load(name)
+    except scripts.ScriptError as e:
+        raise _script_err(e)
+
+    async def work(job):
+        await scripts.run(job, script, r.speed, r.loops)
+    return {"job": manager.start("script", f"Run script {name}", work).id}
+
+
+# ---------- live screen (H.264 via WebCodecs, PNG fallback) + input ----------
 
 @app.websocket("/ws/screen")
 async def screen(ws: WebSocket):
@@ -934,28 +1093,30 @@ async def screen(ws: WebSocket):
     except adb.AdbError:
         await ws.close(code=1008)
         return
+    serial = adb.serial()
     mode = "png" if ws.query_params.get("mode") == "png" else "h264"
-    geo = {"w": 1080, "h": 1920, "gen": 0, "evdev": None}  # current (rotated) size, stream generation
+    rc = RemoteControl()
+    rc.engine = "adb" if ws.query_params.get("input") == "adb" else "auto"
+    await rc.refresh()
+    outbox: asyncio.Queue = asyncio.Queue(maxsize=20)
 
     async def monitor():
-        """Keep the display size fresh (apps can rotate it) and decide if raw touch is safe."""
+        """Keep display size / input capability fresh (apps can rotate the screen)."""
         while True:
-            try:
-                d = await adb.display_info()
-                if d["cur"] != (geo["w"], geo["h"]):
-                    geo["w"], geo["h"] = d["cur"]
-                    geo["gen"] += 1  # new size -> restart the video stream
-                info = await inputs.touch_info()
-                geo["evdev"] = info if info and not d["rotated"] and await adb.user_rotation() == 0 else None
-            except adb.AdbError:
-                pass
             await asyncio.sleep(2)
+            await rc.refresh()
 
-    try:
-        d = await adb.display_info()
-        geo["w"], geo["h"] = d["cur"]
-    except adb.AdbError:
-        pass
+    clip_cb = lambda text: outbox.full() or outbox.put_nowait({"clipboard": text})  # noqa: E731
+    held = {"session": None}
+
+    async def start_helper():
+        session = await scrcpy.manager.acquire(serial)
+        if session:
+            held["session"] = session
+            session.clip_listeners.append(clip_cb)
+            await outbox.put({"helper": True})
+        else:
+            await outbox.put({"helper": False})
 
     async def pump():
         try:
@@ -963,14 +1124,16 @@ async def screen(ws: WebSocket):
             if mode == "h264":
                 while True:
                     try:
-                        gen = geo["gen"]
-                        stream = video.h264_stream(geo["w"], geo["h"])
+                        gen = rc.gen
+                        stream = video.h264_stream(rc.w, rc.h)
                         async for nal in stream:
                             if nal is None:
                                 await ws.send_text(json.dumps({"reset": True}))
                             else:
                                 await ws.send_bytes(nal)
-                            if geo["gen"] != gen:
+                            while not outbox.empty():
+                                await ws.send_text(json.dumps(outbox.get_nowait()))
+                            if rc.gen != gen:
                                 break
                         await stream.aclose()
                         await ws.send_text(json.dumps({"reset": True}))
@@ -984,12 +1147,22 @@ async def screen(ws: WebSocket):
                     except adb.AdbError as e:
                         await ws.send_text(json.dumps({"error": str(e)}))
                         await asyncio.sleep(2)
+                    while not outbox.empty():
+                        await ws.send_text(json.dumps(outbox.get_nowait()))
                     await asyncio.sleep(1 / config.STREAM_FPS)
         except (WebSocketDisconnect, RuntimeError):
             pass
 
-    tasks = [asyncio.create_task(pump()), asyncio.create_task(monitor())]
-    touch = {"tid": 0, "down": None, "t0": 0.0}
+    async def outbox_pump():
+        """Helper events (clipboard, status) must not wait for the next video frame."""
+        try:
+            while True:
+                await ws.send_text(json.dumps(await outbox.get()))
+        except (WebSocketDisconnect, RuntimeError):
+            pass
+
+    tasks = [asyncio.create_task(pump()), asyncio.create_task(monitor()),
+             asyncio.create_task(start_helper()), asyncio.create_task(outbox_pump())]
     try:
         while True:
             try:
@@ -998,52 +1171,26 @@ async def screen(ws: WebSocket):
                     continue
             except ValueError:
                 continue
+            scripts.recorder.add(serial, m)
             try:
-                t = m.get("type")
-                # coordinates are fractions (0..1) of the picture, so any stream size works
-                frac = lambda k: min(max(float(m[k]), 0.0), 1.0)  # noqa: E731
-                px = lambda k, dim: int(frac(k) * (geo[dim] - 1))  # noqa: E731
-                if t == "touch":
-                    phase, nx, ny = m["phase"], frac("x"), frac("y")
-                    if geo["evdev"]:
-                        if phase == "down":
-                            touch["tid"] = (touch["tid"] + 1) % 60000
-                        await adb.fire(inputs.touch_command(geo["evdev"], phase, nx, ny, touch["tid"]))
-                    elif phase == "down":
-                        touch["down"], touch["t0"] = (nx, ny), time.time()
-                    elif phase == "up" and touch["down"]:
-                        (x0, y0), ms = touch["down"], int((time.time() - touch["t0"]) * 1000)
-                        touch["down"] = None
-                        if abs(nx - x0) * geo["w"] < 12 and abs(ny - y0) * geo["h"] < 12:
-                            await adb.tap(int(nx * (geo["w"] - 1)), int(ny * (geo["h"] - 1)))
-                        else:
-                            await adb.swipe(int(x0 * (geo["w"] - 1)), int(y0 * (geo["h"] - 1)),
-                                            int(nx * (geo["w"] - 1)), int(ny * (geo["h"] - 1)), max(ms, 100))
-                elif t == "scroll":
-                    # mouse wheel: a short swipe in the scroll direction
-                    dy = max(-1.0, min(1.0, float(m["dy"])))
-                    x, y = px("x", "w"), px("y", "h")
-                    y2 = int(min(max(y - dy * geo["h"] * 0.25, 1), geo["h"] - 2))
-                    await adb.swipe(x, y, x, y2, 120)
-                elif t == "tap":
-                    await adb.tap(px("x", "w"), px("y", "h"))
-                elif t == "swipe":
-                    await adb.swipe(px("x1", "w"), px("y1", "h"), px("x2", "w"), px("y2", "h"),
-                                    int(m.get("ms", 200)))
-                elif t == "key":
-                    await adb.key(m["key"])
-                elif t == "text":
-                    await adb.text(m["text"])
-                elif t == "rotate":
-                    await adb.rotate(int(m["rotation"]))
-                    inputs.forget()
-            except (adb.AdbError, KeyError, ValueError, TypeError):
+                warn = await rc.handle(m)
+                if warn:
+                    await outbox.put({"warn": warn})
+            except adb.AdbError as e:
+                if m.get("type") in ("pinch", "clip_set"):
+                    await outbox.put({"warn": str(e)})
+            except (scrcpy.ScrcpyError, KeyError, ValueError, TypeError):
                 pass
     except WebSocketDisconnect:
         pass
     finally:
         for tk in tasks:
             tk.cancel()
+        live = scrcpy.manager.sessions.get(serial)
+        for sess in {held["session"], live}:
+            if sess and clip_cb in sess.clip_listeners:
+                sess.clip_listeners.remove(clip_cb)
+        await scrcpy.manager.release(serial)
 
 
 @app.get("/")

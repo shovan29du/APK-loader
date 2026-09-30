@@ -27,6 +27,10 @@ def main():
         from app import hardware
         print(hardware.describe())
         return
+    if "--setup-helper" in sys.argv:       # scrcpy-server for clipboard / audio / multi-touch
+        from app import scrcpy
+        scrcpy.fetch_server(lambda m: print("==>", m, flush=True))
+        return
     if "--setup-emulator" in sys.argv:
         if "--playstore" in sys.argv:  # image with the real Google Play Store (no root)
             from app import settings
