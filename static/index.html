@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>APK Loader</title>
+<style>
+:root{--bg:#f6f7f9;--fg:#1c1e21;--card:#fff;--line:#d9dce1;--accent:#2563eb}
+@media(prefers-color-scheme:dark){:root{--bg:#15171a;--fg:#e6e8eb;--card:#1e2126;--line:#33373d;--accent:#5b8def}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px system-ui,sans-serif}
+main{display:grid;grid-template-columns:minmax(320px,440px) 1fr;gap:16px;padding:16px;min-height:100vh}
+@media(max-width:800px){main{grid-template-columns:1fr}}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px}
+h1{font-size:18px;margin:0 0 8px}.tabs{display:flex;gap:4px;flex-wrap:wrap;margin-bottom:10px}
+button,input,select{font:inherit;color:inherit;background:var(--card);border:1px solid var(--line);border-radius:6px;padding:6px 10px}
+button{cursor:pointer}button.on,button.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
+button.danger{color:#c62828}.row{display:flex;gap:6px;margin-bottom:8px}.row input{flex:1;min-width:0}
+.item{display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--line)}
+.item img{width:32px;height:32px;border-radius:6px}.item .t{flex:1;min-width:0;overflow-wrap:anywhere}
+.item small{opacity:.65;display:block}.pane{display:none}.pane.on{display:block}
+#log{white-space:pre-wrap;font-size:12px;margin-top:8px;max-height:140px;overflow:auto}
+#screenwrap{display:flex;flex-direction:column;align-items:center;gap:8px}
+canvas{max-width:100%;max-height:75vh;background:#000;border-radius:8px;touch-action:none;cursor:pointer}
+#status{font-size:12px;opacity:.7}
+</style></head><body><main>
+<section class="card">
+ <h1>APK Loader</h1><div id="status">connecting…</div>
+ <div class="tabs" id="tabs"></div>
+
+ <div class="pane" id="p-market">
+  <div class="row"><select id="prov"></select><input id="q" placeholder="Search apps…"><button id="go">Search</button></div>
+  <div id="results"></div>
+  <button class="primary" id="installSel">Install selected</button>
+  <label><input type="checkbox" id="runLast"> launch last installed</label>
+ </div>
+
+ <div class="pane" id="p-url">
+  <textarea id="urls" rows="4" style="width:100%" placeholder="One direct .apk URL per line"></textarea>
+  <button class="primary" id="installUrls">Download &amp; install</button>
+ </div>
+
+ <div class="pane" id="p-upload">
+  <input type="file" id="files" accept=".apk" multiple>
+  <p><label><input type="checkbox" id="split"> files are split APKs of ONE app</label><br>
+  <label><input type="checkbox" id="runUp"> launch after install</label></p>
+  <button class="primary" id="doUpload">Install</button>
+ </div>
+
+ <div class="pane" id="p-apps"><button id="refApps">Refresh</button><div id="apps"></div></div>
+ <div class="pane" id="p-lib"><button id="refLib">Refresh</button><div id="lib"></div></div>
+ <div id="log"></div>
+</section>
+
+<section class="card" id="screenwrap">
+ <canvas id="screen" width="360" height="640"></canvas>
+ <div class="row">
+  <button data-k="KEYCODE_BACK">◀ Back</button><button data-k="KEYCODE_HOME">● Home</button>
+  <button data-k="KEYCODE_APP_SWITCH">■ Recents</button>
+  <input id="type" placeholder="type text + Enter"></div>
+</section></main>
+<script>
+const $=s=>document.querySelector(s);
+let token=localStorage.getItem('apkToken')||'';
+const log=m=>{$('#log').textContent=m+'\n'+$('#log').textContent};
+async function api(path,opts={}){
+  opts.headers={...(opts.headers||{}),...(token?{Authorization:'Bearer '+token}:{})};
+  let r=await fetch(path,opts);
+  if(r.status==401){token=prompt('API token')||'';localStorage.setItem('apkToken',token);return api(path,opts)}
+  if(!r.ok){let d=await r.json().catch(()=>({}));throw new Error(d.detail||r.statusText)}
+  return r;
+}
+const j=(p,o)=>api(p,o).then(r=>r.json());
+const post=(p,b)=>j(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+async function saveBlob(path,name){
+  const b=await (await api(path)).blob();const a=document.createElement('a');
+  a.href=URL.createObjectURL(b);a.download=name;a.click();URL.revokeObjectURL(a.href)}
+const report=res=>log(res.results.map(r=>(r.ok?'✔ ':'✘ ')+(r.file||r.id)+(r.package?' → '+r.package:'')+(r.error?': '+r.error:'')).join('\n'));
+
+// tabs
+const tabs=[['market','Marketplaces'],['url','URLs'],['upload','Upload'],['apps','Installed'],['lib','APK files']];
+tabs.forEach(([id,l],i)=>{const b=document.createElement('button');b.textContent=l;b.onclick=()=>{
+  document.querySelectorAll('.pane').forEach(p=>p.classList.toggle('on',p.id=='p-'+id));
+  [...$('#tabs').children].forEach(c=>c.classList.toggle('on',c==b));
+  if(id=='apps')loadApps();if(id=='lib')loadLib()};$('#tabs').append(b);if(!i)b.click()});
+
+// marketplace
+j('/api/providers').then(ps=>ps.filter(p=>p!='direct').forEach(p=>$('#prov').add(new Option(p,p))));
+$('#go').onclick=async()=>{
+  $('#results').textContent='Searching…';
+  try{const apps=await j(`/api/search?provider=${$('#prov').value}&q=${encodeURIComponent($('#q').value)}`);
+   $('#results').innerHTML=apps.map(a=>`<label class="item"><input type="checkbox" data-p="${esc(a.provider)}" data-id="${esc(a.id)}">
+    ${a.icon?`<img src="${esc(a.icon)}" alt="">`:''}<span class="t">${esc(a.name)}<small>${esc(a.id)} ${esc(a.version)}</small></span></label>`).join('')||'No results'}
+  catch(e){$('#results').textContent=e.message}};
+$('#q').onkeydown=e=>e.key=='Enter'&&$('#go').click();
+async function batch(items,run){log('Installing '+items.length+' app(s)…');
+  try{report(await post('/api/install',{items,run_last:run}))}catch(e){log('✘ '+e.message)}}
+$('#installSel').onclick=()=>{const items=[...document.querySelectorAll('#results input:checked')].map(c=>({provider:c.dataset.p,id:c.dataset.id}));
+  items.length?batch(items,$('#runLast').checked):log('Select at least one app')};
+$('#installUrls').onclick=()=>{const items=$('#urls').value.split('\n').map(s=>s.trim()).filter(Boolean).map(id=>({provider:'direct',id}));
+  items.length&&batch(items,false)};
+
+// upload
+$('#doUpload').onclick=async()=>{const fs=$('#files').files;if(!fs.length)return log('Choose .apk files');
+  const fd=new FormData();[...fs].forEach(f=>fd.append('files',f));
+  fd.append('split',$('#split').checked);fd.append('run',$('#runUp').checked);
+  log('Uploading…');try{report(await j('/api/upload',{method:'POST',body:fd}))}catch(e){log('✘ '+e.message)}};
+
+// installed apps: launch / copy / uninstall
+async function loadApps(){const ps=await j('/api/apps');
+  $('#apps').innerHTML=ps.map(p=>`<div class="item"><span class="t">${esc(p)}</span>
+   <button data-a="launch" data-p="${esc(p)}">Run</button><button data-a="copy" data-p="${esc(p)}">Copy APK</button>
+   <button class="danger" data-a="uninstall" data-p="${esc(p)}">Uninstall</button></div>`).join('')||'No user apps installed'}
+$('#apps').onclick=async e=>{const b=e.target.closest('button');if(!b)return;const p=b.dataset.p;
+  try{if(b.dataset.a=='launch'){await post('/api/launch',{package:p});log('Launched '+p)}
+   else if(b.dataset.a=='copy'){await saveBlob(`/api/apps/${p}/apk`,p+'.apk');log('Copied '+p)}
+   else if(confirm('Uninstall '+p+'?')){await post('/api/uninstall',{package:p});log('Uninstalled '+p);loadApps()}}
+  catch(err){log('✘ '+err.message)}};
+$('#refApps').onclick=loadApps;
+
+// stored APK files: download copy / delete
+async function loadLib(){const l=await j('/api/apks');
+  $('#lib').innerHTML=l.map(d=>`<div class="item"><span class="t">${d.files.map(f=>esc(f.name)+` <small>${(f.size/1048576).toFixed(1)} MB</small>`).join('')}</span>
+   <button data-a="dl" data-id="${d.id}" data-n="${esc(d.files[0]?.name||'')}">Copy</button>
+   <button class="danger" data-a="del" data-id="${d.id}">Delete</button></div>`).join('')||'No stored APK files'}
+$('#lib').onclick=async e=>{const b=e.target.closest('button');if(!b)return;
+  try{if(b.dataset.a=='dl')await saveBlob(`/api/apks/${b.dataset.id}/${encodeURIComponent(b.dataset.n)}`,b.dataset.n);
+   else if(confirm('Delete this APK file?')){await j('/api/apks/'+b.dataset.id,{method:'DELETE'});loadLib()}}
+  catch(err){log('✘ '+err.message)}};
+$('#refLib').onclick=loadLib;
+
+// live screen
+const cv=$('#screen'),ctx=cv.getContext('2d');let ws,dev=null;
+function connect(){ws=new WebSocket((location.protocol=='https:'?'wss://':'ws://')+location.host+'/ws/screen'+(token?'?token='+encodeURIComponent(token):''));
+ ws.binaryType='blob';
+ ws.onmessage=async m=>{if(typeof m.data=='string'){$('#status').textContent=JSON.parse(m.data).error;return}
+  const bmp=await createImageBitmap(m.data);cv.width=bmp.width;cv.height=bmp.height;ctx.drawImage(bmp,0,0);dev={w:bmp.width,h:bmp.height};$('#status').textContent='connected'};
+ ws.onclose=()=>setTimeout(connect,2000)}
+connect();
+const pt=e=>{const r=cv.getBoundingClientRect();return[Math.round((e.clientX-r.left)*cv.width/r.width),Math.round((e.clientY-r.top)*cv.height/r.height)]};
+const send=o=>ws&&ws.readyState==1&&ws.send(JSON.stringify(o));
+let down=null;cv.onpointerdown=e=>down={p:pt(e),t:Date.now()};
+cv.onpointerup=e=>{if(!down)return;const[x1,y1]=down.p,[x2,y2]=pt(e),ms=Date.now()-down.t;down=null;
+ Math.hypot(x2-x1,y2-y1)<12?send({type:'tap',x:x2,y:y2}):send({type:'swipe',x1,y1,x2,y2,ms:Math.max(ms,100)})};
+document.querySelectorAll('[data-k]').forEach(b=>b.onclick=()=>send({type:'key',key:b.dataset.k}));
+$('#type').onkeydown=e=>{if(e.key=='Enter'){send({type:'text',text:e.target.value});send({type:'key',key:'KEYCODE_ENTER'});e.target.value=''}};
+</script></body></html>

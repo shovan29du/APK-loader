@@ -1,0 +1,15 @@
+services:
+  android:            # Android runtime (redroid). Needs a Linux host with binder/ashmem kernel support.
+    image: redroid/redroid:13.0.0-latest
+    privileged: true
+    command: androidboot.redroid_width=720 androidboot.redroid_height=1280 androidboot.redroid_dpi=320
+    volumes: [android-data:/data]
+  web:
+    build: .
+    depends_on: [android]
+    ports: ["8000:8000"]
+    environment:
+      ADB_SERIAL: android:5555
+      # API_TOKEN: change-me   # set this if exposed beyond localhost
+    volumes: [apks:/srv/downloads]
+volumes: {android-data: {}, apks: {}}
