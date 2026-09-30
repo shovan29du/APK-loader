@@ -18,8 +18,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
 
-from . import (__version__, adb, config, emulator, installer, plugins, registry, safety, settings,
-               updates, video, watcher)
+from . import (__version__, adb, config, devices, emulator, history, inputs, installer, plugins, registry,
+               safety, settings, updates, video, watcher)
 from .jobs import manager
 from .providers import ARCHIVE_EXTS, PROVIDERS, check_public_url, safe_filename
 
@@ -86,6 +86,7 @@ async def background_loop():
     while True:
         try:
             purge_old_downloads()
+            history.purge_old_rollbacks()
             if (await adb.status())["connected"]:
                 state["updates"] = await updates.app_updates()
                 state["checked"] = time.time()
@@ -104,7 +105,9 @@ async def lifespan(app):
     yield
     for t in tasks:
         t.cancel()
-    await asyncio.to_thread(emulator.controller.stop)
+    adb.close_channels()
+    for c in list(emulator.controllers.values()):
+        await asyncio.to_thread(c.stop)
 
 
 app = FastAPI(title="APK Loader", version=__version__, lifespan=lifespan)
@@ -132,6 +135,10 @@ def request_allowed(headers, method: str) -> bool:
 async def origin_guard(request: Request, call_next):
     if not request_allowed(request.headers, request.method):
         return JSONResponse({"detail": "forbidden origin or host"}, status_code=403)
+    try:  # which device this request targets (header from the UI, or ?device= for downloads)
+        adb.use_serial(request.headers.get("x-device") or request.query_params.get("device"))
+    except adb.AdbError as e:
+        return JSONResponse({"detail": str(e)}, status_code=400)
     return await call_next(request)
 
 
@@ -218,6 +225,7 @@ async def status():
     s["emulator"] = {"installed": emulator.installed(), "running": emulator.controller.running(),
                      "message": state["emulator_msg"]}
     s["version"] = __version__
+    s["evdev"] = bool(await inputs.touch_info()) if s.get("connected") else False
     return s
 
 
@@ -306,7 +314,7 @@ def _install_job(items: list[Item], run_last: bool, allow_unsafe: bool):
                 await download(meta.url, dest, prog)
                 job.progress = base + span * 0.7
                 job.message = f"Checking and installing {label}…"
-                res = await installer.verify_and_install(dest, meta, allow_unsafe, item.provider, item.id)
+                res = await installer.verify_and_install(dest, meta, allow_unsafe, item.provider, item.id, label)
                 job.results.append({"label": label, **res})
             except Exception as e:
                 _fail(job, label, e)
@@ -612,23 +620,119 @@ async def delete_backup(name: str):
     return {"ok": True}
 
 
-# ---------- emulator ----------
+# ---------- devices, wireless pairing ----------
 
+class Endpoint(BaseModel):
+    host: str
+    port: int
+    code: str = ""
+
+
+@app.get("/api/devices", dependencies=[Depends(auth)])
+async def get_devices():
+    try:
+        devs = await devices.list_devices()
+    except adb.AdbError:
+        devs = []
+    ems = [{"name": n, "running": n in emulator.controllers and emulator.controllers[n].running(),
+            "serial": emulator.controllers[n].serial if n in emulator.controllers else ""}
+           for n in emulator.list_avds()]
+    return {"devices": devs, "emulators": ems, "max_emulators": emulator.max_instances(),
+            "selected": adb.serial()}
+
+
+@app.get("/api/devices/mdns", dependencies=[Depends(auth)])
+async def get_mdns():
+    return await devices.mdns_services()
+
+
+@app.post("/api/devices/pair", dependencies=[Depends(auth)])
+async def pair_device(e: Endpoint):
+    try:
+        return {"message": await devices.pair(e.host, e.port, e.code)}
+    except adb.AdbError as err:
+        raise HTTPException(400, str(err))
+
+
+@app.post("/api/devices/connect", dependencies=[Depends(auth)])
+async def connect_device(e: Endpoint):
+    try:
+        return {"serial": await devices.connect_wifi(e.host, e.port)}
+    except adb.AdbError as err:
+        raise HTTPException(400, str(err))
+
+
+@app.post("/api/devices/disconnect", dependencies=[Depends(auth)])
+async def disconnect_device():
+    dev = adb.serial()
+    if ":" not in dev:
+        raise HTTPException(400, "only wireless devices can be disconnected")
+    await adb._run("disconnect", dev, timeout=15)
+    return {"ok": True}
+
+
+# ---------- emulators (several at once) ----------
+
+class EmuName(BaseModel):
+    name: str
+
+
+def _emu_ctl(name: str):
+    try:
+        return emulator.get_controller(name)
+    except RuntimeError as e:
+        raise HTTPException(404, str(e))
+
+
+@app.post("/api/emulators", dependencies=[Depends(auth)])
+async def emulator_create(n: EmuName):
+    async def work(job):
+        job.message = f"Creating {n.name}…"
+        await asyncio.to_thread(emulator.create_avd, n.name)
+        job.results.append({"ok": True, "label": n.name})
+        job.message = ""
+    return {"job": manager.start("emulator", f"Create emulator {n.name}", work, serial=False).id}
+
+
+@app.post("/api/emulators/{name}/start", dependencies=[Depends(auth)])
+async def emulator_start_named(name: str):
+    ctl = _emu_ctl(name)
+    if not ctl.running() and emulator.running_count() >= emulator.max_instances():
+        raise HTTPException(400, f"this machine can run {emulator.max_instances()} emulator(s) at once")
+
+    async def work(job):
+        job.message = f"Booting {name}…"
+        await asyncio.to_thread(ctl.start)
+        await emulator.wait_boot(ctl=ctl)
+        job.results.append({"ok": True, "label": name, "serial": ctl.serial})
+        job.message = ""
+    return {"job": manager.start("emulator", f"Start {name}", work, serial=False).id, "serial": ctl.serial}
+
+
+@app.post("/api/emulators/{name}/stop", dependencies=[Depends(auth)])
+async def emulator_stop_named(name: str):
+    await asyncio.to_thread(_emu_ctl(name).stop)
+    return {"ok": True}
+
+
+@app.delete("/api/emulators/{name}", dependencies=[Depends(auth)])
+async def emulator_delete(name: str):
+    try:
+        await asyncio.to_thread(emulator.delete_avd, name)
+    except RuntimeError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True}
+
+
+# legacy single-emulator endpoints (primary instance)
 @app.post("/api/emulator/start", dependencies=[Depends(auth)])
 async def emulator_start():
-    async def work(job):
-        job.message = "Booting emulator…"
-        await asyncio.to_thread(emulator.controller.start)
-        await emulator.wait_boot()
-        job.results.append({"ok": True, "label": "emulator"})
-        job.message = ""
-    return {"job": manager.start("emulator", "Start emulator", work, serial=False).id}
+    return await emulator_start_named(emulator.AVD_NAME)
 
 
 @app.post("/api/emulator/stop", dependencies=[Depends(auth)])
 async def emulator_stop():
-    await asyncio.to_thread(emulator.controller.stop)
-    return {"ok": True}
+    return await emulator_stop_named(emulator.AVD_NAME)
 
 
 @app.post("/api/emulator/setup", dependencies=[Depends(auth)])
@@ -645,7 +749,178 @@ async def emulator_setup():
     return {"job": manager.start("emulator", "Set up Android emulator", work, serial=False).id}
 
 
-# ---------- live screen (H.264 via WebCodecs, PNG fallback) ----------
+# ---------- snapshots / network / perf / logs ----------
+
+class Snap(BaseModel):
+    name: str
+
+
+@app.get("/api/snapshots", dependencies=[Depends(auth)])
+async def snapshots_list():
+    try:
+        return await devices.snapshots()
+    except adb.AdbError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/api/snapshots", dependencies=[Depends(auth)])
+async def snapshots_save(s: Snap):
+    try:
+        await devices.snapshot_save(s.name)
+    except adb.AdbError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True}
+
+
+@app.post("/api/snapshots/{name}/load", dependencies=[Depends(auth)])
+async def snapshots_load(name: str):
+    try:
+        await devices.snapshot_load(name)
+    except adb.AdbError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True}
+
+
+@app.delete("/api/snapshots/{name}", dependencies=[Depends(auth)])
+async def snapshots_delete(name: str):
+    try:
+        await devices.snapshot_delete(name)
+    except adb.AdbError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True}
+
+
+class Net(BaseModel):
+    speed: str | None = None
+    delay: str | None = None
+    proxy: str | None = None
+    offline: bool | None = None
+
+
+@app.get("/api/network", dependencies=[Depends(auth)])
+async def network_get():
+    return await devices.network_status()
+
+
+@app.post("/api/network", dependencies=[Depends(auth)])
+async def network_set(n: Net):
+    try:
+        await devices.set_network(n.speed, n.delay, n.proxy, n.offline)
+    except adb.AdbError as e:
+        raise HTTPException(400, str(e))
+    return await devices.network_status()
+
+
+@app.get("/api/perf", dependencies=[Depends(auth)])
+async def perf():
+    try:
+        return await devices.perf()
+    except adb.AdbError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.get("/api/logs/crashes", dependencies=[Depends(auth)])
+async def log_crashes():
+    try:
+        return {"text": await devices.crashes()}
+    except adb.AdbError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.websocket("/ws/logs")
+async def logs_ws(ws: WebSocket):
+    if not request_allowed(ws.headers, "WS") or (
+            config.API_TOKEN and not token_ok(ws.query_params.get("token", ""))):
+        await ws.close(code=1008)
+        return
+    await ws.accept()
+    proc = None
+    try:
+        adb.use_serial(ws.query_params.get("device"))
+        args = await devices.logcat_args(ws.query_params.get("level", "W"), ws.query_params.get("package") or None)
+        proc = await devices.spawn_logcat(args)
+        batch: list[str] = []
+
+        async def flush_loop():
+            while True:
+                await asyncio.sleep(0.15)
+                if batch:
+                    lines = batch[:]
+                    batch.clear()
+                    await ws.send_text(json.dumps({"lines": lines}))
+        flusher = asyncio.create_task(flush_loop())
+        try:
+            while line := await proc.stdout.readline():
+                batch.append(line.decode(errors="replace").rstrip())
+                if len(batch) > 2000:
+                    del batch[:1000]
+        finally:
+            flusher.cancel()
+    except adb.AdbError as e:
+        await ws.send_text(json.dumps({"error": str(e)}))
+    except (WebSocketDisconnect, RuntimeError):
+        pass
+    finally:
+        if proc and proc.returncode is None:
+            proc.kill()
+
+
+# ---------- install history / retry / rollback ----------
+
+@app.get("/api/history", dependencies=[Depends(auth)])
+async def history_list():
+    out = []
+    for e in history.load():
+        d = dict(e)
+        d["can_rollback"] = bool(e.get("rollback_dir")) and Path(e["rollback_dir"]).is_dir() and e.get("ok")
+        d["can_retry"] = e.get("kind") == "install" and (bool(e.get("provider")) or Path(e.get("file") or "x").is_file())
+        out.append(d)
+    return out
+
+
+@app.post("/api/history/{entry_id}/retry", dependencies=[Depends(auth)])
+async def history_retry(entry_id: str):
+    e = history.get(entry_id)
+    if not e or e.get("kind") != "install":
+        raise HTTPException(404, "no such install")
+    if e.get("provider"):
+        return {"job": manager.start("install", f"Retry {e['label']}", _install_job(
+            [Item(provider=e["provider"], id=e["app_id"])], False, False)).id}
+    f = Path(e.get("file") or "")
+    if not f.is_file():
+        raise HTTPException(400, "the stored file has been cleaned up; upload it again")
+
+    async def work(job):
+        job.message = f"Installing {f.name}…"
+        job.results.append({"label": e["label"], **await installer.verify_and_install(f, None, False, label=e["label"])})
+        job.message = ""
+    return {"job": manager.start("install", f"Retry {e['label']}", work).id}
+
+
+@app.post("/api/history/{entry_id}/rollback", dependencies=[Depends(auth)])
+async def history_rollback(entry_id: str):
+    e = history.get(entry_id)
+    if not e or not e.get("ok"):
+        raise HTTPException(404, "no such install")
+
+    async def work(job):
+        job.message = f"Rolling back {e.get('package')}…"
+        try:
+            pkg = await installer.rollback(e)
+            job.results.append({"label": f"rollback {pkg}", "ok": True, "package": pkg})
+        except adb.AdbError as err:
+            _fail(job, e.get("package", "rollback"), err)
+        job.message = ""
+    return {"job": manager.start("rollback", f"Roll back {e.get('package')}", work).id}
+
+
+@app.delete("/api/history/{entry_id}", dependencies=[Depends(auth)])
+async def history_delete(entry_id: str):
+    history.delete(entry_id)
+    return {"ok": True}
+
+
+# ---------- live screen (H.264 via WebCodecs, PNG fallback) + low-latency input ----------
 
 @app.websocket("/ws/screen")
 async def screen(ws: WebSocket):
@@ -654,17 +929,33 @@ async def screen(ws: WebSocket):
         await ws.close(code=1008)
         return
     await ws.accept()
+    try:
+        adb.use_serial(ws.query_params.get("device"))
+    except adb.AdbError:
+        await ws.close(code=1008)
+        return
     mode = "png" if ws.query_params.get("mode") == "png" else "h264"
-    size = {"w": 1080, "h": 1920}
+    geo = {"w": 1080, "h": 1920, "gen": 0, "evdev": None}  # current (rotated) size, stream generation
 
-    async def refresh_size():
-        try:
-            s = await adb.screen_size()
-            size["w"], size["h"] = s["width"], s["height"]
-        except adb.AdbError:
-            pass
+    async def monitor():
+        """Keep the display size fresh (apps can rotate it) and decide if raw touch is safe."""
+        while True:
+            try:
+                d = await adb.display_info()
+                if d["cur"] != (geo["w"], geo["h"]):
+                    geo["w"], geo["h"] = d["cur"]
+                    geo["gen"] += 1  # new size -> restart the video stream
+                info = await inputs.touch_info()
+                geo["evdev"] = info if info and not d["rotated"] and await adb.user_rotation() == 0 else None
+            except adb.AdbError:
+                pass
+            await asyncio.sleep(2)
 
-    await refresh_size()
+    try:
+        d = await adb.display_info()
+        geo["w"], geo["h"] = d["cur"]
+    except adb.AdbError:
+        pass
 
     async def pump():
         try:
@@ -672,11 +963,17 @@ async def screen(ws: WebSocket):
             if mode == "h264":
                 while True:
                     try:
-                        async for nal in video.h264_stream(size["w"], size["h"]):
+                        gen = geo["gen"]
+                        stream = video.h264_stream(geo["w"], geo["h"])
+                        async for nal in stream:
                             if nal is None:
                                 await ws.send_text(json.dumps({"reset": True}))
                             else:
                                 await ws.send_bytes(nal)
+                            if geo["gen"] != gen:
+                                break
+                        await stream.aclose()
+                        await ws.send_text(json.dumps({"reset": True}))
                     except adb.AdbError as e:
                         await ws.send_text(json.dumps({"error": str(e)}))
                         await asyncio.sleep(3)
@@ -691,7 +988,8 @@ async def screen(ws: WebSocket):
         except (WebSocketDisconnect, RuntimeError):
             pass
 
-    task = asyncio.create_task(pump())
+    tasks = [asyncio.create_task(pump()), asyncio.create_task(monitor())]
+    touch = {"tid": 0, "down": None, "t0": 0.0}
     try:
         while True:
             try:
@@ -703,8 +1001,31 @@ async def screen(ws: WebSocket):
             try:
                 t = m.get("type")
                 # coordinates are fractions (0..1) of the picture, so any stream size works
-                px = lambda k, dim: int(min(max(float(m[k]), 0.0), 1.0) * (size[dim] - 1))  # noqa: E731
-                if t == "tap":
+                frac = lambda k: min(max(float(m[k]), 0.0), 1.0)  # noqa: E731
+                px = lambda k, dim: int(frac(k) * (geo[dim] - 1))  # noqa: E731
+                if t == "touch":
+                    phase, nx, ny = m["phase"], frac("x"), frac("y")
+                    if geo["evdev"]:
+                        if phase == "down":
+                            touch["tid"] = (touch["tid"] + 1) % 60000
+                        await adb.fire(inputs.touch_command(geo["evdev"], phase, nx, ny, touch["tid"]))
+                    elif phase == "down":
+                        touch["down"], touch["t0"] = (nx, ny), time.time()
+                    elif phase == "up" and touch["down"]:
+                        (x0, y0), ms = touch["down"], int((time.time() - touch["t0"]) * 1000)
+                        touch["down"] = None
+                        if abs(nx - x0) * geo["w"] < 12 and abs(ny - y0) * geo["h"] < 12:
+                            await adb.tap(int(nx * (geo["w"] - 1)), int(ny * (geo["h"] - 1)))
+                        else:
+                            await adb.swipe(int(x0 * (geo["w"] - 1)), int(y0 * (geo["h"] - 1)),
+                                            int(nx * (geo["w"] - 1)), int(ny * (geo["h"] - 1)), max(ms, 100))
+                elif t == "scroll":
+                    # mouse wheel: a short swipe in the scroll direction
+                    dy = max(-1.0, min(1.0, float(m["dy"])))
+                    x, y = px("x", "w"), px("y", "h")
+                    y2 = int(min(max(y - dy * geo["h"] * 0.25, 1), geo["h"] - 2))
+                    await adb.swipe(x, y, x, y2, 120)
+                elif t == "tap":
                     await adb.tap(px("x", "w"), px("y", "h"))
                 elif t == "swipe":
                     await adb.swipe(px("x1", "w"), px("y1", "h"), px("x2", "w"), px("y2", "h"),
@@ -715,14 +1036,14 @@ async def screen(ws: WebSocket):
                     await adb.text(m["text"])
                 elif t == "rotate":
                     await adb.rotate(int(m["rotation"]))
-                    await asyncio.sleep(0.5)
-                    await refresh_size()
-            except (adb.AdbError, KeyError, ValueError):
+                    inputs.forget()
+            except (adb.AdbError, KeyError, ValueError, TypeError):
                 pass
     except WebSocketDisconnect:
         pass
     finally:
-        task.cancel()
+        for tk in tasks:
+            tk.cancel()
 
 
 @app.get("/")

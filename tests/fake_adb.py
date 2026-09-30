@@ -5,15 +5,41 @@ import sys
 import time
 
 a = sys.argv[1:]
+dev = ""
 if a[:1] == ["-s"]:
-    a = a[2:]
+    dev, a = a[1], a[2:]
 log = os.environ.get("FAKE_ADB_LOG")
+if log and dev:
+    with open(log, "a") as f:
+        f.write(f"serial:{dev}\n")
 if log:
     with open(log, "a") as f:
         f.write(" ".join(a) + "\n")
 out = sys.stdout.buffer
-if a[:1] == ["connect"] or a[:1] == ["get-state"]:
+if a == ["shell"]:                      # persistent shell: log every stdin line
+    for line in sys.stdin:
+        if log:
+            with open(log, "a") as f:
+                f.write("stdin: " + line.strip() + "\n")
+    sys.exit(0)
+if a[:1] == ["devices"]:
+    print("List of devices attached")
+    print("emulator-5554          device product:sdk model:Pixel_5 device:generic transport_id:1")
+    print("192.168.1.20:5555      device product:x model:Pixel_8 device:y transport_id:2")
+elif a[:1] == ["pair"]:
+    print("Successfully paired to " + a[1])
+elif a[:1] == ["connect"] or a[:1] == ["get-state"]:
     print("device")
+elif a[:2] == ["shell", "dumpsys window displays | grep -m1 'cur='"]:
+    print("  init=1080x2400 420dpi cur=1080x2400 app=1080x2400 rng=1080x1008-2400x2328")
+elif a[:2] == ["shell", "getevent"]:
+    print('add device 1: /dev/input/event2\n  name:     "virtio_input_multi_touch_1"\n  events:\n    ABS (0003): ABS_MT_SLOT : value 0, min 0, max 9, fuzz 0\n'
+          '                ABS_MT_POSITION_X : value 0, min 0, max 32767, fuzz 0, flat 0, resolution 0\n'
+          '                ABS_MT_POSITION_Y : value 0, min 0, max 32767, fuzz 0, flat 0, resolution 0\n  input props:\n    INPUT_PROP_DIRECT')
+elif a[:2] == ["shell", "sendevent /dev/input/event2 0 0 0 && echo OK"]:
+    print("OK")
+elif a[:4] == ["shell", "settings", "get", "system"]:
+    print("0")
 elif a[:2] == ["shell", "wm"] and a[2] == "size":
     print("Physical size: 1080x2400")
 elif a[:1] == ["exec-out"] and a[1] == "screencap":

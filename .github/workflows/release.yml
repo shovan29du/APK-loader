@@ -28,7 +28,17 @@ jobs:
       - name: Install Inno Setup
         if: runner.os == 'Windows'
         run: choco install innosetup -y --no-progress
-      - run: python packaging/build.py
+      - name: Build (signs when certificate secrets are configured)
+        run: python packaging/build.py
+        env:
+          WIN_CERT_PFX_B64: ${{ secrets.WIN_CERT_PFX_B64 }}
+          WIN_CERT_PASSWORD: ${{ secrets.WIN_CERT_PASSWORD }}
+          MACOS_CERT_P12_B64: ${{ secrets.MACOS_CERT_P12_B64 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
       - uses: actions/upload-artifact@v4
         with:
           name: apkloader-${{ runner.os }}
@@ -37,6 +47,7 @@ jobs:
             dist/*.zip
             dist/*.dmg
             dist/*.deb
+            dist/SHA256SUMS.txt
 
   release:
     if: startsWith(github.ref, 'refs/tags/')

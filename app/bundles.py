@@ -139,7 +139,7 @@ async def install_aab(path: Path) -> str:
                     "-keyalg", "RSA", "-keysize", "2048", "-validity", "10000")
     apks = path.with_suffix(".apks")
     adb_bin = shutil.which(config.ADB_BIN) or config.ADB_BIN
-    common = [f"--adb={adb_bin}", f"--device-id={config.ADB_SERIAL}"]
+    common = [f"--adb={adb_bin}", f"--device-id={adb.serial()}"]
     await _exec(java, "-jar", str(jar), "build-apks", f"--bundle={path}", f"--output={apks}",
                 "--overwrite", "--connected-device", f"--ks={ks}", "--ks-pass=pass:android",
                 "--ks-key-alias=apkloader", "--key-pass=pass:android", *common)

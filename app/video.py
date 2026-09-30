@@ -48,7 +48,7 @@ async def h264_stream(width: int, height: int):
     while True:
         try:
             proc = await asyncio.create_subprocess_exec(
-                config.ADB_BIN, "-s", config.ADB_SERIAL, "exec-out", "screenrecord",
+                config.ADB_BIN, "-s", adb.serial(), "exec-out", "screenrecord",
                 "--output-format=h264", f"--size={w}x{h}", f"--bit-rate={config.VIDEO_BITRATE}",
                 "--time-limit", "180", "-",
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)

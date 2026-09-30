@@ -16,6 +16,13 @@ Shortcuts go on the normal Desktop **and** the OneDrive Desktop. Flags: `--no-em
 > Running the installer with the emulator enabled **accepts the Android SDK License Agreement**
 > (https://developer.android.com/studio/terms) on your behalf and downloads ~2 GB. Use `--no-emulator` to opt out.
 
+### Signing (removes the Windows SmartScreen / macOS Gatekeeper warnings)
+`packaging/build.py` signs automatically when these repository secrets exist (otherwise it builds unsigned):
+Windows: `WIN_CERT_PFX_B64`, `WIN_CERT_PASSWORD` (a code-signing certificate from a CA — you must buy this).
+macOS: `MACOS_CERT_P12_B64`, `MACOS_CERT_PASSWORD`, `MACOS_SIGN_IDENTITY`, plus `APPLE_ID`, `APPLE_TEAM_ID`, `APPLE_APP_PASSWORD`
+for notarization (needs an Apple Developer Program membership). New Windows certificates can still show SmartScreen
+warnings until they build reputation. Each release also ships `SHA256SUMS.txt`.
+
 No Python? Release builds (`.exe` installer, `.dmg`, `.deb`) are produced by CI on `v*` tags
 (`packaging/build.py`). They are unsigned, so Windows SmartScreen / macOS Gatekeeper will warn.
 Packaged builds set the emulator up from **Device → Set up / repair**.
@@ -37,6 +44,14 @@ and BIOS virtualization (setup prints the exact command if acceleration is missi
 - Purges stored APK files older than 7 days.
 
 ## Features
+- **Responsive input**: one persistent `adb shell` per device (no process per tap) and, when the touchscreen node is writable,
+  real-time press/drag/release via raw touch events (falls back to `input` for rotated screens). Click the screen, then type;
+  Ctrl+V pastes text; the mouse wheel scrolls.
+- **Several devices**: pick any emulator, USB or Wi-Fi phone from the device list; run more than one emulator (2 on 16 GB).
+- **Wi-Fi pairing** (Android 11+ Wireless debugging, pairing code). Only local-network addresses are accepted.
+- **History**: every install is logged; *Retry*, and *Roll back* (updates snapshot the old APK first; data is kept even when Android blocks downgrades).
+- **Emulator snapshots**: save/restore the whole emulator state. **Network**: speed/latency presets (emulator), HTTP proxy and offline switch (any device).
+- **Screen recording** to `.webm` in the browser; **Debug** tab with live CPU/RAM, top processes and a logcat viewer (level/package/text filter, crash buffer).
 - **Video**: H.264 via `adb screenrecord` decoded with WebCodecs (Chrome/Edge/Safari; PNG fallback elsewhere). No audio.
 - **Marketplaces**: F-Droid, Aptoide, direct URLs, and plugins (see below). Multi-select, background jobs with progress bars.
 - **Formats**: `.apk`, `.xapk` (incl. OBB), `.apks`, `.aab` (via bundletool) — split APKs are filtered for the device ABI/density and installed together.

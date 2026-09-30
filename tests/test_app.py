@@ -45,6 +45,10 @@ def client(tmp_path, monkeypatch):
     async def status():
         return {"connected": True}
 
+    async def versions():
+        return dict(st.get("versions", {}))
+
+    monkeypatch.setattr(adb, "installed_versions", versions)
     monkeypatch.setattr(adb, "third_party_packages", pkgs)
     monkeypatch.setattr(adb, "install", install)
     monkeypatch.setattr(adb, "install_multiple", install_multiple)
@@ -247,7 +251,7 @@ def test_websocket_h264_stream_and_fractional_taps(tmp_path, fake_adb, monkeypat
             nals = [ws.receive_bytes() for _ in range(4)]
         assert [n[4] & 0x1F for n in nals] == [7, 8, 5, 1]   # SPS, PPS, IDR, P-slice
         time.sleep(0.3)
-        assert "shell input tap 539 599" in fake_adb.read_text()   # 0.5*1079, 0.25*2399
+        assert "stdin: input tap 539 599" in fake_adb.read_text()   # 0.5*1079, 0.25*2399
 
 
 def test_websocket_rejects_foreign_origin(tmp_path, fake_adb, monkeypatch):
@@ -259,3 +263,167 @@ def test_websocket_rejects_foreign_origin(tmp_path, fake_adb, monkeypatch):
         with pytest.raises(WebSocketDisconnect):
             with c.websocket_connect("/ws/screen", headers={"host": "localhost", "Origin": "https://evil.example"}) as ws:
                 ws.receive_json()
+
+
+# ---------------- v1.2 features ----------------
+GETEVENT = '''add device 1: /dev/input/event0
+  name:     "Power Button"
+  events:
+    KEY (0001): KEY_POWER
+add device 2: /dev/input/event2
+  name:     "virtio_input_multi_touch_1"
+  events:
+    ABS (0003): ABS_MT_SLOT           : value 0, min 0, max 9, fuzz 0, flat 0, resolution 0
+                ABS_MT_POSITION_X     : value 0, min 0, max 32767, fuzz 0, flat 0, resolution 0
+                ABS_MT_POSITION_Y     : value 0, min 0, max 32767, fuzz 0, flat 0, resolution 0
+  input props:
+    INPUT_PROP_DIRECT
+'''
+
+
+def test_touch_parse_and_commands():
+    from app import inputs
+    info = inputs.parse_getevent(GETEVENT)
+    assert info == {"dev": "/dev/input/event2", "maxx": 32767, "maxy": 32767}
+    down = inputs.touch_command(info, "down", 0.5, 0.25, 7)
+    assert "sendevent /dev/input/event2 3 57 7" in down and "3 53 16383" in down and "3 54 8191" in down
+    assert down.rstrip().endswith("0 0 0")
+    up = inputs.touch_command(info, "up", 0, 0, 7)
+    assert "3 57 -1" in up and "1 330 0" in up
+    assert inputs.parse_getevent("add device 1: /dev/input/event5\n  name: \"x\"\n") is None
+
+
+def test_text_command_quotes_and_filters():
+    c = adb.text_command("hi there; rm -rf / $(x) é")
+    assert c.startswith("input text '") and "é" not in c and "hi%sthere" in c
+    assert adb.text_command("é") == ""
+
+
+def test_devices_and_pairing_rules():
+    from app import devices
+    devs = devices.parse_devices(
+        "List of devices attached\nemulator-5554 device product:sdk model:Pixel_5\n192.168.1.20:5555 device model:Pixel_8\nABC123 unauthorized\n")
+    assert [d["kind"] for d in devs] == ["emulator", "wifi", "usb"]
+    assert devs[2]["state"] == "unauthorized"
+    assert devices.check_lan_endpoint("192.168.1.20", 5555) == "192.168.1.20:5555"
+    for bad in ("8.8.8.8", "1.1.1.1"):
+        with pytest.raises(adb.AdbError):
+            devices.check_lan_endpoint(bad, 5555)
+    with pytest.raises(adb.AdbError):
+        devices.check_lan_endpoint("evil;rm", 5555)
+
+
+def test_snapshot_and_perf_parsing():
+    from app import devices
+    snaps = devices.parse_snapshots(
+        "List of snapshots present on all disks:\nID        TAG                 VM SIZE                DATE       VM CLOCK\n--        default_boot        1.2 GB     2026-09-30 10:00:00   00:01:00.000\n2         clean               1.1 GB     2026-09-30 11:00:00   00:02:00.000\nOK\n")
+    assert [s["name"] for s in snaps] == ["default_boot", "clean"]
+    with pytest.raises(adb.AdbError):
+        devices._snap_name("bad name;rm")
+    text = "cpu  100 0 100 700 100 0 0 0\n---\nMemTotal:  4000000 kB\nMemAvailable:  1000000 kB\n---\n 500000 system_server\n 200000 com.app\n"
+    r1, cur = devices.parse_perf(text, None)
+    assert r1["cpu_pct"] is None and r1["mem_total_kb"] == 4000000 and r1["top"][0]["name"] == "system_server"
+    text2 = text.replace("cpu  100 0 100 700 100", "cpu  200 0 200 800 200")
+    r2, _ = devices.parse_perf(text2, cur)
+    assert r2["cpu_pct"] == 50.0   # 200 busy of 400 total since the last sample
+
+
+def test_network_validation():
+    import asyncio
+    from app import devices
+    for kw in ({"proxy": "host;rm:80"}, {"proxy": "nocolon"}):
+        with pytest.raises(adb.AdbError):
+            asyncio.run(devices.set_network(**kw))
+    with pytest.raises(adb.AdbError):
+        asyncio.run(devices.set_network(speed="warp"))
+
+
+def test_device_header_selects_serial_and_bad_serial_rejected(tmp_path, fake_adb, monkeypatch):
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(config, "DOWNLOAD_DIR", tmp_path / "dl")
+    (tmp_path / "dl").mkdir()
+    with TestClient(main.app, base_url="http://localhost") as c:
+        assert c.get("/api/status", headers={"X-Device": "emulator-5556"}).json()["serial"] == "emulator-5556"
+        assert "serial:emulator-5556" in fake_adb.read_text()
+        assert c.get("/api/status", headers={"X-Device": "--help;x"}).status_code == 400
+        devs = c.get("/api/devices").json()
+        assert [d["serial"] for d in devs["devices"]] == ["emulator-5554", "192.168.1.20:5555"]
+        assert c.post("/api/devices/pair", json={"host": "192.168.1.20", "port": 37000, "code": "123456"}).status_code == 200
+        assert c.post("/api/devices/pair", json={"host": "8.8.8.8", "port": 37000, "code": "123456"}).status_code == 400
+        assert c.post("/api/devices/pair", json={"host": "192.168.1.20", "port": 37000, "code": "12"}).status_code == 400
+
+
+def test_websocket_realtime_touch_and_wheel(tmp_path, fake_adb, monkeypatch):
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(config, "DOWNLOAD_DIR", tmp_path / "dl")
+    (tmp_path / "dl").mkdir()
+    with TestClient(main.app, base_url="http://localhost") as c:
+        with c.websocket_connect("/ws/screen?mode=png", headers={"host": "localhost"}) as ws:
+            ws.receive_json()
+            time.sleep(0.6)   # let the monitor detect the touchscreen
+            for phase, y in (("down", 0.5), ("move", 0.6), ("up", 0.6)):
+                ws.send_text('{"type":"touch","phase":"%s","x":0.5,"y":%s}' % (phase, y))
+            ws.send_text('{"type":"scroll","x":0.5,"y":0.5,"dy":1}')
+            ws.send_text('{"type":"text","text":"hello world"}')
+            time.sleep(0.6)
+        log = fake_adb.read_text()
+    assert "stdin: sendevent /dev/input/event2 3 47 0; sendevent /dev/input/event2 3 57" in log   # raw touch down
+    assert "3 54 19660" in log                                        # move to y=0.6
+    assert "stdin: input swipe 539 1199 539 599 120" in log           # wheel -> swipe up
+    assert "stdin: input text hello%sworld" in log
+    assert log.count("\nshell\nstdin:") == 1                          # one persistent shell, not one per event
+
+
+@pytest.mark.asyncio
+async def test_rollback_keeps_data_when_downgrade_blocked(tmp_path, monkeypatch):
+    from app import history, installer
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    snap = history.rollback_root() / "e1"
+    snap.mkdir(parents=True)
+    (snap / "0_base.apk").write_bytes(make_apk())
+    calls = []
+
+    async def install(path, downgrade=False):
+        calls.append(("install", downgrade))
+        if downgrade:
+            raise adb.AdbError("INSTALL_FAILED_VERSION_DOWNGRADE")
+        return "Success"
+
+    async def uninstall(pkg, keep_data=False):
+        calls.append(("uninstall", keep_data))
+
+    monkeypatch.setattr(adb, "install", install)
+    monkeypatch.setattr(adb, "uninstall", uninstall)
+    entry = {"id": "e1", "ok": True, "package": "com.x.app", "rollback_dir": str(snap), "prev_version_code": 3}
+    assert await installer.rollback(entry) == "com.x.app"
+    assert calls == [("install", True), ("uninstall", True), ("install", False)]
+    assert history.load()[0]["kind"] == "rollback"
+
+
+def test_history_records_update_with_snapshot_and_retry(client, monkeypatch):
+    async def versions():
+        return {"com.big.game": 5}
+
+    async def apk_paths(pkg):
+        return ["/data/app/base.apk"]
+
+    async def pull(remote, local):
+        open(local, "wb").write(b"old")
+
+    monkeypatch.setattr(adb, "installed_versions", versions)
+    monkeypatch.setattr(adb, "apk_paths", apk_paths)
+    monkeypatch.setattr(adb, "pull", pull)
+    import json
+    x = io.BytesIO()
+    with zipfile.ZipFile(x, "w") as z:
+        z.writestr("manifest.json", json.dumps({"package_name": "com.big.game", "split_apks": [{"file": "base.apk"}]}))
+        z.writestr("base.apk", make_apk())
+    j = upload(client, [("game.xapk", x.getvalue())])
+    assert j["results"][0]["ok"]
+    h = client.get("/api/history").json()
+    assert h[0]["prev_version_code"] == 5 and h[0]["can_rollback"] and h[0]["can_retry"]
+    # retry re-installs the stored file
+    r = client.post(f"/api/history/{h[0]['id']}/retry")
+    assert r.status_code == 200 and wait_job(client, r.json()["job"])["status"] == "done"
+    assert len(client.get("/api/history").json()) == 2
+    assert client.delete(f"/api/history/{h[0]['id']}").status_code == 200

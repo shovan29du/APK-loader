@@ -125,12 +125,12 @@ def sdk_adb() -> Path:
 
 
 def installed() -> bool:
-    return emulator_bin().exists() and (Path.home() / ".android/avd" / f"{AVD_NAME}.avd").exists()
+    return emulator_bin().exists() and avd_exists(AVD_NAME)
 
 
-def tune_avd(log=print):
+def tune_avd(log=print, name: str = AVD_NAME):
     """Write performance settings for this machine into the AVD's config.ini."""
-    cfg = Path.home() / ".android/avd" / f"{AVD_NAME}.avd" / "config.ini"
+    cfg = Path.home() / ".android/avd" / f"{name}.avd" / "config.ini"
     if not cfg.exists():
         return
     r = hardware.recommend()
@@ -225,8 +225,15 @@ def setup(log=print, with_bundletool: bool = True):
 # ---------------- runtime control ----------------
 
 class Controller:
-    def __init__(self):
+    """One emulator process (an AVD on its own console port; adb serial emulator-<port>)."""
+
+    def __init__(self, name: str = AVD_NAME, port: int = 5554):
+        self.name, self.port = name, port
         self.proc: subprocess.Popen | None = None
+
+    @property
+    def serial(self) -> str:
+        return f"emulator-{self.port}"
 
     def running(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
@@ -234,24 +241,25 @@ class Controller:
     def start(self):
         if self.running():
             return
-        if not installed():
+        if not (emulator_bin().exists() and avd_exists(self.name)):
             raise RuntimeError("emulator is not installed (run full_install.py, or use Set up emulator)")
-        tune_avd(lambda m: None)
+        tune_avd(lambda m: None, self.name)
         prefer_dgpu(lambda m: None)
         gpu = hardware.recommend()["emu_gpu"]
         # Quick-boot snapshots stay enabled: after the first run the emulator resumes in seconds from the SSD.
         self.proc = subprocess.Popen(
-            [str(emulator_bin()), "-avd", AVD_NAME, "-port", "5554", "-no-window", "-no-audio",
+            [str(emulator_bin()), "-avd", self.name, "-port", str(self.port), "-no-window", "-no-audio",
              "-no-boot-anim", "-gpu", gpu],
             env=env(), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-        config.ADB_SERIAL = SERIAL
+        if self.name == AVD_NAME:
+            config.ADB_SERIAL = self.serial
         if sdk_adb().exists():
             config.ADB_BIN = str(sdk_adb())
 
     def stop(self):
         if self.running():
             try:  # graceful kill lets the emulator save its quick-boot snapshot
-                subprocess.run([config.ADB_BIN, "-s", SERIAL, "emu", "kill"], timeout=20,
+                subprocess.run([config.ADB_BIN, "-s", self.serial, "emu", "kill"], timeout=20,
                                capture_output=True)
                 self.proc.wait(30)
             except Exception:
@@ -270,16 +278,73 @@ class Controller:
         return ""
 
 
-controller = Controller()
+def avd_exists(name: str) -> bool:
+    return (Path.home() / ".android/avd" / f"{name}.avd").exists()
 
 
-async def wait_boot(timeout: float = 300):
+def max_instances() -> int:
+    """Each emulator wants ~4 GB + host headroom: 16 GB -> 2 at once."""
+    return max(1, hardware.total_ram_mb() // 6144)
+
+
+controllers: dict[str, Controller] = {AVD_NAME: Controller(AVD_NAME, 5554)}
+controller = controllers[AVD_NAME]  # the primary instance (kept for callers that only need one)
+
+
+def list_avds() -> list[str]:
+    if not emulator_bin().exists():
+        return []
+    try:
+        out = subprocess.run([str(emulator_bin()), "-list-avds"], capture_output=True, text=True,
+                             env=env(), timeout=30).stdout
+    except Exception:
+        return []
+    return [l.strip() for l in out.splitlines() if l.strip() and " " not in l.strip()]
+
+
+def get_controller(name: str) -> Controller:
+    if name not in list_avds():
+        raise RuntimeError(f"no such emulator: {name}")
+    if name not in controllers:
+        used = {c.port for c in controllers.values()}
+        controllers[name] = Controller(name, next(p for p in range(5556, 5600, 2) if p not in used))
+    return controllers[name]
+
+
+def running_count() -> int:
+    return sum(1 for c in controllers.values() if c.running())
+
+
+def create_avd(name: str, log=print):
+    """Clone-style: a fresh AVD from the installed system image, tuned like the primary."""
+    import re as _re
+    if not _re.fullmatch(r"[A-Za-z0-9_\-]{1,30}", name):
+        raise RuntimeError("name: letters, digits, _ and - (max 30)")
+    if name in list_avds():
+        raise RuntimeError("an emulator with that name already exists")
+    image = f"system-images;android-{API_LEVEL};{flavor()};{abi()}"
+    _run([avdmanager(), "create", "avd", "-n", name, "-k", image, "-d", "pixel_5", "--force"], "no\n")
+    tune_avd(log, name)
+
+
+def delete_avd(name: str):
+    if name == AVD_NAME:
+        raise RuntimeError("the primary emulator cannot be deleted")
+    if name in controllers and controllers[name].running():
+        raise RuntimeError("stop it first")
+    _run([avdmanager(), "delete", "avd", "-n", name])
+    controllers.pop(name, None)
+
+
+async def wait_boot(timeout: float = 300, ctl: Controller | None = None):
     from . import adb
+    ctl = ctl or controller
+    adb.use_serial(ctl.serial)
     loop = asyncio.get_event_loop()
     end = loop.time() + timeout
     while loop.time() < end:
-        if controller.proc and controller.proc.poll() is not None:
-            raise RuntimeError(controller.early_error() or "emulator exited (hardware acceleration missing?)")
+        if ctl.proc and ctl.proc.poll() is not None:
+            raise RuntimeError(ctl.early_error() or "emulator exited (hardware acceleration missing?)")
         try:
             if (await adb._dev("shell", "getprop", "sys.boot_completed", timeout=10)).strip() == "1":
                 return

@@ -35,8 +35,10 @@ def main():
         return
 
     # Prefer our own adb (bundled or from the SDK) over whatever is on PATH.
+    mac_res = os.path.join(os.path.dirname(sys.executable), "..", "Resources", "platform-tools")
     for d in (emulator.SDK / "platform-tools", config.APP_DIR / "platform-tools",
-              config.DATA_DIR / "platform-tools"):
+              config.DATA_DIR / "platform-tools", os.path.normpath(mac_res)):
+        d = __import__("pathlib").Path(d)
         if d.is_dir():
             os.environ["PATH"] = str(d) + os.pathsep + os.environ.get("PATH", "")
             break

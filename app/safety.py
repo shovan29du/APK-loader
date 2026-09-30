@@ -1,6 +1,7 @@
 """Pre-install checks: hashes, archive sanity, signatures, optional VirusTotal."""
 import asyncio
 import hashlib
+import json
 import os
 import shutil
 import zipfile
@@ -43,6 +44,37 @@ def hashes(path: Path) -> tuple[str, str]:
             s.update(chunk)
             m.update(chunk)
     return s.hexdigest(), m.hexdigest()
+
+
+def _build_tool(name: str) -> str | None:
+    if shutil.which(name):
+        return shutil.which(name)
+    for r in (config.DATA_DIR / "android-sdk", Path(os.getenv("ANDROID_HOME", "/nonexistent"))):
+        bt = r / "build-tools"
+        if bt.is_dir():
+            for v in sorted(bt.iterdir(), reverse=True):
+                for n in (name, name + ".exe", name + ".bat"):
+                    if (v / n).exists():
+                        return str(v / n)
+    return None
+
+
+async def peek_package(path: Path) -> str:
+    """Package name of an artifact before installing it (best effort, '' if unknown)."""
+    ext = path.suffix.lower()
+    try:
+        if ext == ".xapk":
+            with zipfile.ZipFile(path) as z:
+                return json.loads(z.read("manifest.json").decode("utf-8-sig")).get("package_name", "")
+        if ext == ".apk" and (tool := _build_tool("aapt2")):
+            proc = await asyncio.create_subprocess_exec(
+                tool, "dump", "packagename", str(path),
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+            out = (await proc.communicate())[0].decode(errors="replace").strip()
+            return out if proc.returncode == 0 and " " not in out else ""
+    except Exception:
+        pass
+    return ""
 
 
 def find_apksigner() -> str | None:
