@@ -45,3 +45,5 @@ SCRCPY = os.getenv("SCRCPY", "1") == "1"
 AUTO_EMULATOR = os.getenv("AUTO_EMULATOR", "1") == "1"
 GITHUB_REPO = os.getenv("APKLOADER_REPO", "shovan29du/APK-loader")
 FILE_ROOTS = ["/sdcard", "/storage/emulated/0", "/data/local/tmp"]
+# Folder(s) "Scan a folder" on this computer is allowed to look under. Defaults to the user's home.
+SCAN_ROOT = Path(os.getenv("SCAN_ROOT", str(Path.home()))).expanduser().resolve()

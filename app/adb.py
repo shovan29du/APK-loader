@@ -1,6 +1,7 @@
 """Thin async wrapper around the `adb` CLI. Every call targets serial() (per-request device)."""
 import asyncio
 import contextvars
+import os
 import posixpath
 import re
 import shlex
@@ -313,11 +314,56 @@ async def _root():
         raise AdbError("backup/restore needs a rootable device (use the bundled emulator or redroid)")
 
 
+async def is_rooted() -> bool:
+    try:
+        await _run("-s", serial(), "root", timeout=20)
+        await asyncio.sleep(1.5)
+        await connect()
+    except AdbError:
+        pass
+    return (await _dev("shell", "id", "-u")).strip() == "0"
+
+
 async def backup_app(package: str, out_path: str):
+    """Full app-data backup. Needs a rootable device (the bundled emulator or redroid)."""
     if not valid_package(package):
         raise AdbError("invalid package name")
     await _root()
+    if not await is_rooted():
+        raise AdbError("full backup needs a rootable device (use the bundled emulator or redroid); "
+                       "try 'Export data (no root)' instead")
     await _stream_stdout_to_file(["exec-out", "tar", "-cf", "-", "-C", "/data/data", package], out_path)
+
+
+async def export_app_data(package: str, out_path: str) -> str:
+    """Best-effort data export that needs no root: run-as (debuggable apps), else public/external
+    storage only. Returns which parts were captured. Based on the standard adb run-as/tar technique
+    used by Android's own `bu backup` tooling and similar community scripts."""
+    if not valid_package(package):
+        raise AdbError("invalid package name")
+    got = []
+    tmp_remote = f"/data/local/tmp/apkloader-export-{os.getpid()}.tar"
+    try:
+        probe = await _dev("shell", f"run-as {package} echo ok 2>&1")
+        if probe.strip() == "ok":
+            await _dev("shell", f"run-as {package} tar -cf {tmp_remote} -C /data/data/{package} .")
+            got.append("private app data (run-as)")
+    except AdbError:
+        pass
+    public_dir = f"/sdcard/Android/data/{package}"
+    has_public = (await _dev("shell", f"[ -d {public_dir} ] && echo yes || echo no")).strip() == "yes"
+    if has_public:
+        combine = f"tar -cf {tmp_remote} -C /sdcard/Android/data {package}" if "private" not in " ".join(got) else                  f"(run-as {package} tar -cf - -C /data/data/{package} . ; tar -cf - -C /sdcard/Android/data {package}) "                  f"| cat > {tmp_remote}.combined && mv {tmp_remote}.combined {tmp_remote}"
+        await _dev("shell", combine)
+        got.append("public app data (/sdcard/Android/data)")
+    if not got:
+        raise AdbError(f"{package} is not debuggable and has no public data folder; "
+                       "full export needs a rootable device (the bundled emulator or redroid)")
+    try:
+        await pull(tmp_remote, out_path)
+    finally:
+        await _dev("shell", f"rm -f {tmp_remote}")
+    return ", ".join(got)
 
 
 async def restore_app(package: str, tar_path: str):

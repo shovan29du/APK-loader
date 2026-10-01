@@ -93,6 +93,54 @@ async def network_status() -> dict:
     return st
 
 
+# ---------- battery / GPS simulation (own implementation; same adb commands used by scrcpy,
+# Android Studio's emulator controls, and similar tools) ----------
+_BATTERY_RE = re.compile(r"^(AC|USB|level|status):", re.M)
+
+
+async def battery_status() -> dict:
+    out = await adb._dev("shell", "dumpsys battery")
+    level = re.search(r"level:\s*(\d+)", out)
+    status = re.search(r"status:\s*(\d+)", out)
+    scale = re.search(r"scale:\s*(\d+)", out)
+    overridden = "(override)" in out.lower() or "UPDATES STOPPED" in out
+    return {"level": int(level.group(1)) if level else None,
+            "scale": int(scale.group(1)) if scale else 100,
+            "status": {1: "unknown", 2: "charging", 3: "discharging", 4: "not charging",
+                      5: "full"}.get(int(status.group(1)), "unknown") if status else "unknown",
+            "simulated": overridden}
+
+
+async def battery_set(level: int, plugged: bool = False):
+    if not 0 <= level <= 100:
+        raise adb.AdbError("battery level must be 0-100")
+    await adb._dev("shell", "dumpsys", "battery", "set", "level", str(level))
+    await adb._dev("shell", "dumpsys", "battery", "set", "status", "2" if plugged else "3")
+
+
+async def battery_reset():
+    await adb._dev("shell", "dumpsys", "battery", "reset")
+
+
+_LAT_RE = re.compile(r"^-?\d{1,2}(\.\d+)?$")
+_LON_RE = re.compile(r"^-?\d{1,3}(\.\d+)?$")
+GPS_PRESETS = {
+    "san_francisco": (37.7749, -122.4194), "new_york": (40.7128, -74.0060),
+    "london": (51.5074, -0.1278), "tokyo": (35.6762, 139.6503),
+    "sydney": (-33.8688, 151.2093), "mumbai": (19.0760, 72.8777),
+    "sao_paulo": (-23.5505, -46.6333), "berlin": (52.5200, 13.4050),
+}
+
+
+async def set_location(lat: float, lon: float):
+    """Emulator only (adb emu geo fix). Real devices have no equivalent without installing a mock-location app."""
+    if not (_LAT_RE.match(str(lat)) and -90 <= float(lat) <= 90):
+        raise adb.AdbError("invalid latitude")
+    if not (_LON_RE.match(str(lon)) and -180 <= float(lon) <= 180):
+        raise adb.AdbError("invalid longitude")
+    await adb.emu("geo", "fix", f"{lon:.6f}", f"{lat:.6f}")
+
+
 async def set_network(speed: str | None = None, delay: str | None = None,
                       proxy: str | None = None, offline: bool | None = None):
     if speed is not None:

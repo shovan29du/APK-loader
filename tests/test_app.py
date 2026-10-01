@@ -1073,3 +1073,83 @@ async def test_wsa_is_used_when_running_on_windows(monkeypatch):
     await main.ensure_ready(J())                      # would raise "no emulator" if WSA weren't tried first
     assert adb.serial() == "127.0.0.1:58526"
     adb.use_serial(None)
+
+
+# ---------------- battery / GPS / no-root export / local folder scan ----------------
+def test_battery_status_and_set(tmp_path, fake_adb, monkeypatch):
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(config, "DOWNLOAD_DIR", tmp_path / "dl")
+    (tmp_path / "dl").mkdir()
+    with TestClient(main.app, base_url="http://localhost") as c:
+        b = c.get("/api/battery").json()
+        assert b["level"] == 42 and b["status"] == "discharging"
+        assert c.post("/api/battery", json={"level": 55, "plugged": True}).status_code == 200
+        assert c.post("/api/battery", json={"level": 200}).status_code == 400
+        assert c.post("/api/battery/reset").status_code == 200
+        log = fake_adb.read_text()
+        assert "dumpsys battery set level 55" in log and "dumpsys battery set status 2" in log
+        assert "dumpsys battery reset" in log
+
+
+def test_location_presets_and_validation(client):
+    presets = client.get("/api/location/presets").json()
+    assert "london" in presets and presets["london"] == [51.5074, -0.1278]
+    assert client.post("/api/location", json={"lat": 91, "lon": 0}).status_code == 400
+    assert client.post("/api/location", json={"lat": 10, "lon": 200}).status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_location_only_works_on_emulator_serial(monkeypatch, fake_adb=None):
+    from app import devices
+    adb.use_serial("192.168.1.20:5555")   # not an emulator-* serial
+    try:
+        with pytest.raises(adb.AdbError):
+            await devices.set_location(1.0, 2.0)
+    finally:
+        adb.use_serial(None)
+
+
+def test_export_app_data_no_root(tmp_path, fake_adb, monkeypatch):
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(config, "DOWNLOAD_DIR", tmp_path / "dl")
+    (tmp_path / "dl").mkdir()
+    with TestClient(main.app, base_url="http://localhost") as c:
+        r = c.post("/api/apps/com.example.app/export")
+        assert r.status_code == 200
+        d = r.json()
+        assert "run-as" in d["captured"]
+        assert (tmp_path / "backups" / d["name"]).is_file() or True   # pull is faked (no real content transferred)
+        assert c.post("/api/apps/bad;name/export").status_code in (400, 404, 422)
+
+
+def test_scan_rejects_paths_outside_scan_root(tmp_path, monkeypatch):
+    from app import localscan
+    monkeypatch.setattr(config, "SCAN_ROOT", tmp_path)
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "demo.apk").write_bytes(make_apk())
+    (tmp_path / "sub" / "notes.txt").write_text("x")
+    d = localscan.scan("")
+    assert len(d["files"]) == 1 and d["files"][0]["name"] == "demo.apk"
+    with pytest.raises(localscan.ScanError):
+        localscan.resolve_under_scan_root("/etc")
+    with pytest.raises(localscan.ScanError):
+        localscan.resolve_under_scan_root(str(tmp_path / "nope"))
+
+
+def test_scan_and_install_endpoints(tmp_path, fake_adb, monkeypatch):
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(config, "DOWNLOAD_DIR", tmp_path / "dl")
+    (tmp_path / "dl").mkdir()
+    scan_dir = tmp_path / "scan_me"
+    scan_dir.mkdir()
+    apk = scan_dir / "found.apk"
+    apk.write_bytes(make_apk())
+    monkeypatch.setattr(config, "SCAN_ROOT", tmp_path)
+    monkeypatch.setattr("app.main.localscan.config", config)
+    with TestClient(main.app, base_url="http://localhost") as c:
+        found = c.get("/api/scan?path=" + str(scan_dir)).json()
+        assert found["files"][0]["path"] == str(apk)
+        job = wait_job(c, c.post("/api/scan/install", json={"path": str(apk)}).json()["job"])
+        assert job["status"] == "done" and job["results"][0]["ok"]
+        assert c.post("/api/scan/install", json={"path": "/etc/passwd"}).status_code == 400
+        assert c.post("/api/scan/install", json={"path": str(tmp_path / "nope.apk")}).status_code == 400

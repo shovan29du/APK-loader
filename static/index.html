@@ -64,6 +64,9 @@ canvas{max-width:100%;max-height:72vh;background:#fff;border:1px solid var(--lin
   <p><label><input type="checkbox" id="split"> the .apk files are split APKs of ONE app</label><br>
   <label><input type="checkbox" id="runUp" checked> open the app after installing</label></p>
   <button class="primary" id="doUpload">Install</button> <progress id="upProg" value="0" max="1" style="display:none;width:120px"></progress>
+  <h3>Scan a folder on this computer</h3>
+  <div class="row"><input id="scanPath" placeholder="folder (blank = home folder)"><button id="scanBtn">Scan</button></div>
+  <div id="scanResults"></div>
  </div>
 
  <div class="pane" id="p-apps"><button id="refApps">Refresh</button><div id="apps"></div></div>
@@ -126,7 +129,14 @@ Add "continue":true to a step to keep going after it fails.</pre></details>
   <div class="row"><button id="up">↑ Up</button><input type="file" id="fup"><button id="fupBtn">Upload here</button></div>
   <div id="fl"></div>
   <h3>App data backups</h3><div class="row"><button id="refBk">Refresh</button></div><div id="bk"></div>
- </div>
+  <h3>Battery <small>(simulated level; works on emulators and most real devices)</small></h3>
+  <div class="row"><input id="battLevel" type="number" min="0" max="100" value="50" size="4">%
+   <label><input type="checkbox" id="battPlug"> plugged in</label>
+   <button id="battSet">Set</button><button id="battReset">Reset to real battery</button></div>
+  <div id="battStatus"></div>
+  <h3>GPS location <small>(emulator only)</small></h3>
+  <div class="row"><select id="geoPreset"></select><button id="geoGo">Set</button></div>
+  <div class="row"><input id="geoLat" placeholder="latitude" size="10"><input id="geoLon" placeholder="longitude" size="10"><button id="geoCustom">Set custom</button></div>
 
  <div id="jobs"></div>
  <label style="display:block;margin-top:8px"><input type="checkbox" id="unsafe"> install even if safety checks fail</label>
@@ -235,7 +245,7 @@ $('#doUpload').onclick=()=>{const fs=$('#files').files;if(!fs.length)return say(
 async function loadApps(){const ps=await j('/api/apps').catch(()=>[]);
   $('#apps').innerHTML=ps.map(p=>`<div class="item"><span class="t">${esc(p)}</span>
    <button data-a="launch" data-p="${esc(p)}">Run</button><button data-a="copy" data-p="${esc(p)}">Copy APK</button>
-   <button data-a="backup" data-p="${esc(p)}">Backup</button>
+   <button data-a="backup" data-p="${esc(p)}">Backup</button><button data-a="export" data-p="${esc(p)}" title="Works without a rootable device">Export data (no root)</button>
    <button class="danger" data-a="uninstall" data-p="${esc(p)}">Uninstall</button>
    <details style="width:100%"><summary><small>more</small></summary><div class="row" style="flex-wrap:wrap">
     <button data-a="stop" data-p="${esc(p)}">Force stop</button><button data-a="info" data-p="${esc(p)}">Info</button>
@@ -249,6 +259,7 @@ $('#apps').onclick=async e=>{const b=e.target.closest('button');if(!b)return;con
    else if(b.dataset.a=='shortcut'){const r=await post(`/api/apps/${p}/shortcut`,{label:p.split('.').pop()});say('Shortcut created: '+r.created.join(', '))}
    else if(b.dataset.a=='clear'){if(confirm('Erase all data of '+p+'? (the app stays installed)')){await post(`/api/apps/${p}/clear`);say('Cleared data of '+p)}}
    else if(b.dataset.a=='backup'){say('Backing up…');const r=await post('/api/backups',{package:p});say('Backup saved: '+r.name)}
+   else if(b.dataset.a=='export'){say('Exporting…');const r=await post(`/api/apps/${p}/export`);say('Exported ('+r.captured+'): '+r.name)}
    else if(confirm('Uninstall '+p+'?')){await post('/api/uninstall',{package:p});say('Uninstalled '+p);loadApps()}}
   catch(err){say('✘ '+err.message)}};
 $('#refApps').onclick=loadApps;
@@ -431,6 +442,28 @@ $('#audioBtn').onclick=()=>{const b=$('#audioBtn');
     const now=audioCtx.currentTime;if(audioNext<now+0.03||audioNext>now+0.5)audioNext=now+0.06;   // keep latency small
     src.start(audioNext);audioNext+=buf.duration};
   audioWs.onclose=()=>{audioWs=null;b.textContent='🔊 Audio';b.classList.remove('on')}};
+
+
+/* ---------- scan a local folder for APK files ---------- */
+async function doScan(){const path=$('#scanPath').value.trim();
+  try{const d=await j('/api/scan?path='+encodeURIComponent(path));$('#scanPath').placeholder=d.scan_root;
+   $('#scanResults').innerHTML=d.files.map(f=>`<div class="item"><span class="t">${esc(f.name)}<small><br>${esc(f.path)} · ${(f.size/1048576).toFixed(1)} MB</small></span>
+    <button class="primary" data-p="${esc(f.path)}">Install</button></div>`).join('')||'No .apk/.xapk/.apks/.aab files found'+(d.truncated?' (showing first 500 matches)':'')}
+  catch(e){$('#scanResults').innerHTML='<small>'+esc(e.message)+'</small>'}}
+$('#scanBtn').onclick=doScan;$('#scanPath').onkeydown=e=>{if(e.key=='Enter')doScan()};
+$('#scanResults').onclick=async e=>{const b=e.target.closest('button');if(!b)return;
+  try{watch((await post('/api/scan/install',{path:b.dataset.p})).job)}catch(err){say('✘ '+err.message)}};
+
+/* ---------- battery / GPS simulation ---------- */
+async function loadBattery(){try{const b=await j('/api/battery');
+  $('#battStatus').innerHTML=`Level: ${b.level}% · ${esc(b.status)}${b.simulated?' · <b>simulated</b>':''}`;
+  if(b.level!=null)$('#battLevel').value=b.level}catch(e){$('#battStatus').textContent=e.message}}
+$('#battSet').onclick=async()=>{try{await post('/api/battery',{level:+$('#battLevel').value,plugged:$('#battPlug').checked});loadBattery()}catch(e){say('✘ '+e.message)}};
+$('#battReset').onclick=async()=>{try{await post('/api/battery/reset');loadBattery()}catch(e){say('✘ '+e.message)}};
+j('/api/location/presets').then(p=>{$('#geoPreset').innerHTML=Object.keys(p).map(k=>`<option value="${k}">${k.replace(/_/g,' ')}</option>`).join('');window._geo=p}).catch(()=>{});
+$('#geoGo').onclick=async()=>{const[lat,lon]=window._geo[$('#geoPreset').value]||[];if(lat==null)return;
+  try{await post('/api/location',{lat,lon});say('Location set to '+$('#geoPreset').value.replace(/_/g,' '))}catch(e){say('✘ '+e.message)}};
+$('#geoCustom').onclick=async()=>{try{await post('/api/location',{lat:+$('#geoLat').value,lon:+$('#geoLon').value});say('Location set')}catch(e){say('✘ '+e.message)}};
 
 /* ---------- status banner + auto refresh ---------- */
 async function refreshStatus(){try{const s=await j('/api/status');

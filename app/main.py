@@ -21,7 +21,7 @@ from pydantic import BaseModel
 from starlette.background import BackgroundTask
 
 from . import (__version__, adb, config, devices, emulator, history, inputs, installer, plugins, registry,
-               safety, scripts, scrcpy, settings, shortcuts, updates, video, watcher)
+               localscan, safety, scripts, scrcpy, settings, shortcuts, updates, video, watcher)
 from .remote import RemoteControl
 from .jobs import manager
 from .providers import ARCHIVE_EXTS, PROVIDERS, check_public_url, safe_filename
@@ -706,6 +706,119 @@ def _backups() -> Path:
     d = config.DATA_DIR / "backups"
     d.mkdir(exist_ok=True)
     return d
+
+
+# ---------- scan a folder on this computer for APKs ----------
+
+@app.get("/api/scan", dependencies=[Depends(auth)])
+async def scan_folder(path: str = ""):
+    try:
+        return await asyncio.to_thread(localscan.scan, path)
+    except localscan.ScanError as e:
+        raise HTTPException(400, str(e))
+
+
+class ScanInstall(BaseModel):
+    path: str
+    split_group: list[str] | None = None
+
+
+@app.post("/api/scan/install", dependencies=[Depends(auth)])
+async def scan_install(body: ScanInstall):
+    paths = body.split_group or [body.path]
+    files = []
+    for p in paths:
+        try:
+            f = Path(p).resolve()
+            f.relative_to(config.SCAN_ROOT)
+        except (OSError, ValueError):
+            raise HTTPException(400, "path is outside the allowed scan folder")
+        if not f.is_file() or f.suffix.lower() not in ARCHIVE_EXTS:
+            raise HTTPException(400, f"not an installable file: {p}")
+        files.append(f)
+    label = ", ".join(f.name for f in files)
+
+    async def work(job):
+        await ensure_ready(job)
+        job.message = f"Installing {label}…"
+        try:
+            if len(files) > 1 and all(f.suffix.lower() == ".apk" for f in files):
+                pkg = await installer.install_artifact(files[0], split_group=files)
+                res = {"ok": True, "package": pkg}
+            else:
+                res = await installer.verify_and_install(files[0], None, False, label=label)
+            job.results.append({"label": label, **res})
+        except Exception as e:
+            _fail(job, label, e)
+        await _launch_last(job, True)
+        job.message = ""
+    return {"job": manager.start("install", f"Install {label} (local folder)", work).id}
+
+
+# ---------- battery / GPS simulation ----------
+
+@app.get("/api/battery", dependencies=[Depends(auth)])
+async def battery_get():
+    try:
+        return await devices.battery_status()
+    except adb.AdbError as e:
+        raise HTTPException(400, str(e))
+
+
+class Battery(BaseModel):
+    level: int
+    plugged: bool = False
+
+
+@app.post("/api/battery", dependencies=[Depends(auth)])
+async def battery_set(b: Battery):
+    try:
+        await devices.battery_set(b.level, b.plugged)
+    except adb.AdbError as e:
+        raise HTTPException(400, str(e))
+    return await devices.battery_status()
+
+
+@app.post("/api/battery/reset", dependencies=[Depends(auth)])
+async def battery_reset_ep():
+    try:
+        await devices.battery_reset()
+    except adb.AdbError as e:
+        raise HTTPException(400, str(e))
+    return await devices.battery_status()
+
+
+class Location(BaseModel):
+    lat: float
+    lon: float
+
+
+@app.get("/api/location/presets", dependencies=[Depends(auth)])
+async def location_presets():
+    return devices.GPS_PRESETS
+
+
+@app.post("/api/location", dependencies=[Depends(auth)])
+async def location_set(loc: Location):
+    try:
+        await devices.set_location(loc.lat, loc.lon)
+    except adb.AdbError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True}
+
+
+# ---------- no-root data export ----------
+
+@app.post("/api/apps/{package}/export", dependencies=[Depends(auth)])
+async def export_app(package: str):
+    """Export app data without needing a rootable device (run-as + public storage)."""
+    dest = _backups() / f"{_pkg(package)}-export-{time.strftime('%Y%m%d-%H%M%S')}.tar"
+    try:
+        captured = await adb.export_app_data(package, str(dest))
+    except adb.AdbError as e:
+        dest.unlink(missing_ok=True)
+        raise HTTPException(400, str(e))
+    return {"name": dest.name, "captured": captured}
 
 
 @app.get("/api/backups", dependencies=[Depends(auth)])

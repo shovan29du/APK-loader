@@ -44,6 +44,13 @@ and BIOS virtualization (setup prints the exact command if acceleration is missi
 - Purges stored APK files older than 7 days.
 
 ## Features
+- **Export app data without root**: *Installed → more → Export data (no root)* uses `run-as` (debuggable apps) and the app's
+  public storage folder — works on ordinary, non-rooted phones, not just the bundled rootable emulator. The full tar **Backup**
+  still needs a rootable device for private data on release-signed apps.
+- **Battery simulation**: set a fake battery level/charging state (`dumpsys battery`) on the Device tab, for testing low-battery
+  behaviour; works on the emulator and most real devices. **GPS location**: city presets or custom lat/lon (emulator only).
+- **Scan a local folder**: point the Upload tab at a folder on this computer (default: your home folder; override with `SCAN_ROOT`)
+  and install any `.apk/.xapk/.apks/.aab` found in it, without copying them into the app first.
 - **App shortcuts** (like WSATools): *Installed → more → Desktop shortcut* puts a shortcut on your Desktop (and OneDrive Desktop) and
   Start menu that opens that one Android app: it starts APK Loader, boots the emulator if needed, and launches the app.
 - **Open with / drag-and-drop**: drop `.apk/.xapk/.apks/.aab` files on the page, or right-click a file → *Open with → Install with APK Loader*

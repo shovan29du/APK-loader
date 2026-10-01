@@ -47,6 +47,18 @@ elif a[:2] == ["shell", "dumpsys window | grep -E 'mCurrentFocus|mFocusedApp' | 
     print("  mCurrentFocus=Window{1a2b u0 com.example.app/com.example.app.MainActivity}")
 elif len(a) == 2 and a[0] == "shell" and a[1].startswith("dumpsys package "):
     print("    versionCode=42 minSdk=24 targetSdk=34\n    versionName=2.5.1\n    firstInstallTime=2026-09-01 10:00:00\n    lastUpdateTime=2026-09-20 11:30:00\n    installerPackageName=com.android.vending")
+elif a[:2] == ["shell", "dumpsys battery"]:
+    print("Current Battery Service state:\n  AC powered: false\n  USB powered: true\n  status: 3\n  level: 42\n  scale: 100")
+elif a[:4] == ["shell", "dumpsys", "battery", "set"]:
+    pass
+elif a[:2] == ["shell", "dumpsys battery reset"] or a[:4] == ["shell", "dumpsys", "battery", "reset"]:
+    pass
+elif a[:1] == ["shell"] and len(a) == 2 and a[1].startswith("run-as ") and "echo ok" in a[1]:
+    print("ok")
+elif a[:1] == ["shell"] and len(a) == 2 and (a[1].startswith("run-as ") or a[1].startswith("[ -d ") or "tar -cf" in a[1]):
+    pass   # export: tar / existence-check commands succeed silently (no file actually produced in this fake)
+elif a[:1] == ["shell"] and len(a) == 2 and a[1].startswith("rm -f /data/local/tmp/apkloader-export"):
+    pass
 elif a[:3] == ["shell", "pm", "clear"]:
     print("Success")
 elif a[:2] == ["shell", "getevent"]:
