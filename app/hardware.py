@@ -6,7 +6,8 @@ Override any value with EMU_RAM_MB, EMU_CORES, EMU_GPU, VIDEO_MAX, VIDEO_BITRATE
 import ctypes
 import os
 import shutil
-import subprocess
+
+from . import procs
 import sys
 
 
@@ -24,7 +25,7 @@ def total_ram_mb() -> int:
             ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m))
             return int(m.total // (1 << 20))
         if sys.platform == "darwin":
-            return int(subprocess.check_output(["sysctl", "-n", "hw.memsize"]).strip()) // (1 << 20)
+            return int(procs.check_output(["sysctl", "-n", "hw.memsize"]).strip()) // (1 << 20)
         return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") // (1 << 20)
     except Exception:
         return 8192
@@ -35,7 +36,7 @@ def nvidia_gpu() -> str:
     if not exe:
         return ""
     try:
-        out = subprocess.run([exe, "--query-gpu=name", "--format=csv,noheader"],
+        out = procs.run([exe, "--query-gpu=name", "--format=csv,noheader"],
                              capture_output=True, text=True, timeout=10).stdout.strip()
         return out.splitlines()[0] if out else ""
     except Exception:

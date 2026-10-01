@@ -12,7 +12,7 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
-from . import config, hardware, settings
+from . import config, hardware, procs, settings
 from .util import safe_extract_zip
 
 SDK = config.DATA_DIR / "android-sdk"
@@ -53,7 +53,7 @@ def _download(url: str, dest: Path, log):
 
 def _java_ok(exe: str) -> bool:
     try:
-        out = subprocess.run([exe, "-version"], capture_output=True, text=True, timeout=20)
+        out = procs.run([exe, "-version"], capture_output=True, text=True, timeout=20)
         m = re.search(r'version "(\d+)', out.stderr + out.stdout)
         return bool(m) and int(m.group(1)) >= 17
     except Exception:
@@ -165,7 +165,7 @@ def accel_status() -> tuple[bool, str]:
     if not emulator_bin().exists():
         return False, "emulator not installed"
     try:
-        p = subprocess.run([str(emulator_bin()), "-accel-check"], capture_output=True,
+        p = procs.run([str(emulator_bin()), "-accel-check"], capture_output=True,
                            text=True, env=env(), timeout=60)
         out = (p.stdout + p.stderr).strip()
         if p.returncode == 0:  # -accel-check exits 0 only when acceleration is usable
@@ -181,7 +181,7 @@ def accel_status() -> tuple[bool, str]:
 
 
 def _run(cmd, input_text=None):
-    p = subprocess.run([str(c) for c in cmd], input=input_text, capture_output=True,
+    p = procs.run([str(c) for c in cmd], input=input_text, capture_output=True,
                        text=True, env=env(), timeout=3600)
     if p.returncode != 0:
         raise RuntimeError((p.stdout + p.stderr).strip()[-800:])
@@ -247,7 +247,7 @@ class Controller:
         prefer_dgpu(lambda m: None)
         gpu = hardware.recommend()["emu_gpu"]
         # Quick-boot snapshots stay enabled: after the first run the emulator resumes in seconds from the SSD.
-        self.proc = subprocess.Popen(
+        self.proc = procs.popen(
             [str(emulator_bin()), "-avd", self.name, "-port", str(self.port), "-no-window", "-no-audio",
              "-no-boot-anim", "-gpu", gpu],
             env=env(), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -259,7 +259,7 @@ class Controller:
     def stop(self):
         if self.running():
             try:  # graceful kill lets the emulator save its quick-boot snapshot
-                subprocess.run([config.ADB_BIN, "-s", self.serial, "emu", "kill"], timeout=20,
+                procs.run([config.ADB_BIN, "-s", self.serial, "emu", "kill"], timeout=20,
                                capture_output=True)
                 self.proc.wait(30)
             except Exception:
@@ -295,7 +295,7 @@ def list_avds() -> list[str]:
     if not emulator_bin().exists():
         return []
     try:
-        out = subprocess.run([str(emulator_bin()), "-list-avds"], capture_output=True, text=True,
+        out = procs.run([str(emulator_bin()), "-list-avds"], capture_output=True, text=True,
                              env=env(), timeout=30).stdout
     except Exception:
         return []

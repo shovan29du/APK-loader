@@ -4,7 +4,7 @@ import ipaddress
 import re
 import socket
 
-from . import adb, config
+from . import adb, config, procs
 
 _HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.\-]{0,252}$")
 
@@ -206,7 +206,7 @@ async def crashes() -> str:
 
 async def spawn_logcat(args: list[str]):
     try:
-        return await asyncio.create_subprocess_exec(
+        return await procs.exec_async(
             config.ADB_BIN, "-s", adb.serial(), *args,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
     except FileNotFoundError:

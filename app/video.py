@@ -1,7 +1,7 @@
 """H.264 screen streaming from `adb exec-out screenrecord` (no device-side agent needed)."""
 import asyncio
 
-from . import adb, config
+from . import adb, config, procs
 
 
 class NalSplitter:
@@ -47,7 +47,7 @@ async def h264_stream(width: int, height: int):
     fails = 0
     while True:
         try:
-            proc = await asyncio.create_subprocess_exec(
+            proc = await procs.exec_async(
                 config.ADB_BIN, "-s", adb.serial(), "exec-out", "screenrecord",
                 "--output-format=h264", f"--size={w}x{h}", f"--bit-rate={config.VIDEO_BITRATE}",
                 "--time-limit", "180", "-",

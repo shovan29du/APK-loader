@@ -1,6 +1,7 @@
 import asyncio
 import json
 import io
+import os
 import time
 import zipfile
 
@@ -792,3 +793,25 @@ def test_audio_needs_helper_message_when_disabled(tmp_path, fake_adb, monkeypatc
     with TestClient(main.app, base_url="http://localhost") as c:       # SCRCPY=False (autouse fixture)
         with c.websocket_connect("/ws/audio", headers={"host": "localhost"}) as ws:
             assert "scrcpy helper" in ws.receive_json()["error"]
+
+
+# ---------------- Windows: no console windows ----------------
+def test_windows_children_start_without_a_console_window():
+    from app import procs
+    assert procs.window_kwargs("nt") == {"creationflags": 0x08000000}
+    assert procs.window_kwargs("posix") == {}
+    assert procs._merge({"creationflags": 0x200})["creationflags"] == 0x200 | 0x08000000 or os.name != "nt"
+
+
+def test_no_module_spawns_processes_directly():
+    """Every subprocess must go through app.procs, or Windows pops up a console window per call."""
+    import pathlib
+    import re
+    bad = []
+    for f in pathlib.Path(main.__file__).parent.glob("*.py"):
+        if f.name == "procs.py":
+            continue
+        for n, line in enumerate(f.read_text().splitlines(), 1):
+            if re.search(r"asyncio\.create_subprocess_exec\(|subprocess\.(run|Popen|check_output|call)\(", line):
+                bad.append(f"{f.name}:{n}")
+    assert not bad, bad

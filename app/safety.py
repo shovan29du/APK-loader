@@ -10,7 +10,7 @@ from pathlib import Path
 
 import httpx
 
-from . import config
+from . import config, procs
 
 
 @dataclass
@@ -67,7 +67,7 @@ async def peek_package(path: Path) -> str:
             with zipfile.ZipFile(path) as z:
                 return json.loads(z.read("manifest.json").decode("utf-8-sig")).get("package_name", "")
         if ext == ".apk" and (tool := _build_tool("aapt2")):
-            proc = await asyncio.create_subprocess_exec(
+            proc = await procs.exec_async(
                 tool, "dump", "packagename", str(path),
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
             out = (await proc.communicate())[0].decode(errors="replace").strip()
@@ -132,7 +132,7 @@ async def _apksigner(path: Path, r: Report):
     tool = find_apksigner()
     if not tool or path.suffix.lower() != ".apk":
         return
-    proc = await asyncio.create_subprocess_exec(
+    proc = await procs.exec_async(
         tool, "verify", "--print-certs", str(path),
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
     out = (await proc.communicate())[0].decode(errors="replace")

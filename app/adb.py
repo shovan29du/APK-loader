@@ -5,7 +5,7 @@ import posixpath
 import re
 import shlex
 
-from . import config
+from . import config, procs
 
 _serial: contextvars.ContextVar = contextvars.ContextVar("adb_serial", default=None)
 _SERIAL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:\-]{0,63}$")
@@ -28,7 +28,7 @@ class AdbError(RuntimeError):
 
 async def _run(*args: str, timeout: float = 120, binary: bool = False):
     try:
-        proc = await asyncio.create_subprocess_exec(
+        proc = await procs.exec_async(
             config.ADB_BIN, *args,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
@@ -129,7 +129,7 @@ class ShellChannel:
             for attempt in (0, 1):
                 if self.proc is None or self.proc.returncode is not None:
                     try:
-                        self.proc = await asyncio.create_subprocess_exec(
+                        self.proc = await procs.exec_async(
                             config.ADB_BIN, "-s", self.dev, "shell",
                             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.DEVNULL,
                             stderr=asyncio.subprocess.DEVNULL)
@@ -245,7 +245,7 @@ async def installed_versions() -> dict[str, int]:
 async def _stream_stdout_to_file(args: list[str], out_path: str, timeout: float = 900):
     with open(out_path, "wb") as f:
         try:
-            proc = await asyncio.create_subprocess_exec(
+            proc = await procs.exec_async(
                 config.ADB_BIN, "-s", serial(), *args,
                 stdout=f, stderr=asyncio.subprocess.PIPE)
         except FileNotFoundError:

@@ -9,7 +9,7 @@ import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import adb, config
+from . import adb, config, procs
 from .util import safe_extract_zip
 
 ABI_RE = re.compile(r"(?:^|[._-])(arm64[_-]v8a|armeabi[_-]v7a|x86[_-]64|x86|armeabi|mips64|mips)$")
@@ -118,7 +118,7 @@ def java_bin() -> str | None:
 
 
 async def _exec(*args: str, timeout: float = 900):
-    proc = await asyncio.create_subprocess_exec(
+    proc = await procs.exec_async(
         *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
     out = (await asyncio.wait_for(proc.communicate(), timeout))[0].decode(errors="replace")
     if proc.returncode != 0:

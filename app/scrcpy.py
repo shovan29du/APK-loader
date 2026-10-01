@@ -12,7 +12,7 @@ import struct
 import urllib.request
 from pathlib import Path
 
-from . import adb, config
+from . import adb, config, procs
 
 VERSION = "4.0"
 URL = f"https://github.com/Genymobile/scrcpy/releases/download/v{VERSION}/scrcpy-server-v{VERSION}"
@@ -123,7 +123,7 @@ class Session:
                 f"audio={'true' if self.audio else 'false'} audio_codec=raw control=true "
                 f"cleanup=false clipboard_autosync=true")
         try:
-            self.proc = await asyncio.create_subprocess_exec(
+            self.proc = await procs.exec_async(
                 config.ADB_BIN, "-s", self.serial, "shell", args,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
         except FileNotFoundError:
