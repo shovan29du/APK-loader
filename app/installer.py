@@ -9,7 +9,7 @@ from .providers import Resolved
 
 async def install_artifact(path: Path, split_group: list[Path] | None = None) -> str:
     """Install one file (or a group of split APKs). Returns the package name if known."""
-    before = await adb.third_party_packages()
+    before = await adb.installed_versions()
     hint = ""
     if split_group:
         await adb.install_multiple([str(p) for p in split_group])
@@ -23,8 +23,9 @@ async def install_artifact(path: Path, split_group: list[Path] | None = None) ->
             hint = await bundles.install_aab(path)
         else:
             raise adb.AdbError(f"unsupported file type {ext}")
-    new = sorted((await adb.third_party_packages()) - before)
-    return new[0] if new else hint
+    after = await adb.installed_versions()
+    changed = sorted(p for p, v in after.items() if before.get(p) != v)   # new app, or a new version of one
+    return changed[0] if changed else hint
 
 
 async def snapshot_current(package: str, entry_id: str) -> str:

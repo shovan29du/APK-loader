@@ -55,7 +55,7 @@ def client(tmp_path, monkeypatch):
         return {"connected": True}
 
     async def versions():
-        return dict(st.get("versions", {}))
+        return {**{p: 1 for p in st["pkgs"]}, **st.get("versions", {})}
 
     monkeypatch.setattr(adb, "installed_versions", versions)
     monkeypatch.setattr(adb, "third_party_packages", pkgs)
@@ -815,3 +815,138 @@ def test_no_module_spawns_processes_directly():
             if re.search(r"asyncio\.create_subprocess_exec\(|subprocess\.(run|Popen|check_output|call)\(", line):
                 bad.append(f"{f.name}:{n}")
     assert not bad, bad
+
+
+def test_ui_key_handlers_never_return_false():
+    """`el.onkeydown = e => e.key=='Enter' && ...` returns false for other keys, which cancels typing."""
+    import pathlib
+    import re
+    html = (pathlib.Path(main.__file__).parent.parent / "static" / "index.html").read_text()
+    bad = re.findall(r"\.on(?:keydown|keypress|keyup|input|beforeinput)\s*=\s*(?:\(?\w*\)?\s*=>)\s*(?!\{)[^;\n]*&&", html)
+    assert not bad, bad
+
+
+# ---------------- install -> runs on the laptop ----------------
+def test_install_opens_the_app_by_default(client, monkeypatch):
+    launched = []
+
+    async def launch(pkg):
+        launched.append(pkg)
+    monkeypatch.setattr(adb, "launch", launch)
+    j = upload(client, [("a.apk", make_apk())])                 # no "run" flag sent: default is to open it
+    assert j["results"][0]["ok"] and launched == [j["results"][0]["package"]]
+    # a batch of marketplace/URL items defaults to opening the last one too
+    from app.main import BatchReq
+    assert BatchReq(items=[]).run_last is True
+
+
+def test_install_boots_the_emulator_when_no_device_is_connected(client, monkeypatch):
+    from app import emulator
+    state = {"up": False, "started": 0}
+
+    async def status():
+        return {"connected": state["up"]}
+
+    async def wait_boot(timeout=300, ctl=None):
+        state["up"] = True
+
+    def start():
+        state["started"] += 1
+    monkeypatch.setattr(adb, "status", status)
+    monkeypatch.setattr(emulator, "installed", lambda: True)
+    monkeypatch.setattr(emulator, "wait_boot", wait_boot)
+    monkeypatch.setattr(emulator.controller, "start", start)
+
+    async def launch(pkg):
+        pass
+    monkeypatch.setattr(adb, "launch", launch)
+    j = upload(client, [("a.apk", make_apk())])
+    assert state["started"] == 1 and j["status"] == "done" and j["results"][0]["ok"]
+
+
+def test_install_without_device_or_emulator_gives_a_clear_error(client, monkeypatch):
+    from app import emulator
+
+    async def status():
+        return {"connected": False}
+    monkeypatch.setattr(adb, "status", status)
+    monkeypatch.setattr(emulator, "installed", lambda: False)
+    r = client.post("/api/upload", files=[("files", ("a.apk", make_apk()))])
+    job = wait_job(client, r.json()["job"])
+    assert job["status"] == "error" and "emulator is not set up" in job["message"]
+    assert client.st["calls"] == []
+
+
+def test_stored_file_install_and_run(client, monkeypatch):
+    launched = []
+
+    async def launch(pkg):
+        launched.append(pkg)
+    monkeypatch.setattr(adb, "launch", launch)
+    upload(client, [("a.apk", make_apk())])
+    entry = client.get("/api/apks").json()[0]
+    client.st["calls"].clear()
+    job = wait_job(client, client.post(f"/api/apks/{entry['id']}/install").json()["job"])
+    assert job["status"] == "done" and client.st["calls"] and launched
+    assert client.post("/api/apks/nonexistent/install").status_code == 404
+
+
+def _build_axml(package: str, utf8: bool) -> bytes:
+    """Minimal binary AndroidManifest (string pool + one <manifest package=...> element)."""
+    import struct
+    strs = ["manifest", "package", package]
+
+    def enc(t):
+        if utf8:
+            b = t.encode()
+            return bytes([len(t), len(b)]) + b + b"\x00"
+        return struct.pack("<H", len(t)) + t.encode("utf-16-le") + b"\x00\x00"
+    blobs = [enc(t) for t in strs]
+    offs, o = [], 0
+    for b in blobs:
+        offs.append(o)
+        o += len(b)
+    data = b"".join(blobs)
+    data += b"\x00" * (-len(data) % 4)
+    start = 28 + 4 * len(strs)
+    pool = struct.pack("<HHIIIIII", 1, 28, start + len(data), len(strs), 0, 0x100 if utf8 else 0, start, 0)
+    pool += struct.pack(f"<{len(strs)}I", *offs) + data
+    attr = struct.pack("<iiiHBBI", -1, 1, 2, 8, 0, 3, 2)               # package="..." (raw string #2)
+    elem = struct.pack("<HHIIIiiHHHHHH", 0x0102, 16, 36 + len(attr), 1, 0xFFFFFFFF, -1, 0, 20, 20, 1, 0, 0, 0) + attr
+    return struct.pack("<HHI", 3, 8, 8 + len(pool) + len(elem)) + pool + elem
+
+
+def test_package_name_read_from_binary_manifest():
+    from app import safety
+    real = (__import__("pathlib").Path(__file__).parent / "data" / "AndroidManifest.bin").read_bytes()
+    assert safety.axml_package(real) == "com.genymobile.scrcpy"           # a real compiled manifest
+    for utf8 in (True, False):
+        assert safety.axml_package(_build_axml("com.example.hello", utf8)) == "com.example.hello"
+    assert safety.axml_package(b"") == "" and safety.axml_package(b"garbage" * 5) == ""
+
+
+def test_reinstalling_an_installed_app_still_opens_it(client, monkeypatch):
+    """Same package already on the device: the before/after diff is empty, so the name must come from the APK."""
+    pkgs = {"com.example.hello": 7}
+    launched = []
+
+    async def versions():
+        return dict(pkgs)
+
+    async def launch(p):
+        launched.append(p)
+    monkeypatch.setattr(adb, "installed_versions", versions)
+    monkeypatch.setattr(adb, "launch", launch)
+
+    async def apk_paths(p):
+        raise adb.AdbError("no snapshot in this test")
+    monkeypatch.setattr(adb, "apk_paths", apk_paths)
+    apk = make_apk({"AndroidManifest.xml": _build_axml("com.example.hello", False)})   # later entry replaces the stub
+    b = io.BytesIO()
+    with zipfile.ZipFile(b, "w") as z:
+        z.writestr("AndroidManifest.xml", _build_axml("com.example.hello", False))
+        z.writestr("META-INF/CERT.RSA", b"sig")
+    del apk
+    j = upload(client, [("hello.apk", b.getvalue())])
+    assert j["results"][0]["ok"] and j["results"][0]["package"] == "com.example.hello"
+    assert launched == ["com.example.hello"]

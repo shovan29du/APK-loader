@@ -59,6 +59,49 @@ def _build_tool(name: str) -> str | None:
     return None
 
 
+def axml_package(data: bytes) -> str:
+    """Package name from a compiled (binary XML) AndroidManifest.xml. Pure Python, no SDK tools needed."""
+    import struct
+    try:
+        if struct.unpack_from("<H", data, 0)[0] != 0x0003:
+            return ""
+        pos, strings = 8, []
+        while pos + 8 <= len(data):
+            ctype, hsize, csize = struct.unpack_from("<HHI", data, pos)
+            if ctype == 0x0001:                                    # string pool
+                count, _styles, flags, start = struct.unpack_from("<IIII", data, pos + 8)
+                offs = struct.unpack_from(f"<{count}I", data, pos + 28)
+                utf8 = bool(flags & 0x100)
+                for o in offs:
+                    q = pos + start + o
+                    if utf8:                                      # u8/u16 char count, then u8/u16 byte count
+                        for _ in range(2):
+                            first = data[q]
+                            n, q = (((first & 0x7F) << 8) | data[q + 1], q + 2) if first & 0x80 else (first, q + 1)
+                        strings.append(data[q:q + n].decode("utf-8", "replace"))
+                    else:                                         # u16 (or u32 if high bit) char count
+                        n = struct.unpack_from("<H", data, q)[0]
+                        q += 2
+                        if n & 0x8000:
+                            n = ((n & 0x7FFF) << 16) | struct.unpack_from("<H", data, q)[0]
+                            q += 2
+                        strings.append(data[q:q + 2 * n].decode("utf-16-le", "replace"))
+            elif ctype == 0x0102 and strings:                      # start element
+                name, = struct.unpack_from("<i", data, pos + 20)
+                attr_start, attr_size, attr_count = struct.unpack_from("<HHH", data, pos + 24)
+                if 0 <= name < len(strings) and strings[name] == "manifest":
+                    base = pos + 16 + attr_start
+                    for i in range(attr_count):
+                        _ns, aname, raw = struct.unpack_from("<iii", data, base + i * attr_size)
+                        if 0 <= aname < len(strings) and strings[aname] == "package" and 0 <= raw < len(strings):
+                            return strings[raw]
+                    return ""
+            pos += max(csize, 8)
+    except (struct.error, IndexError):
+        pass
+    return ""
+
+
 async def peek_package(path: Path) -> str:
     """Package name of an artifact before installing it (best effort, '' if unknown)."""
     ext = path.suffix.lower()
@@ -66,6 +109,10 @@ async def peek_package(path: Path) -> str:
         if ext == ".xapk":
             with zipfile.ZipFile(path) as z:
                 return json.loads(z.read("manifest.json").decode("utf-8-sig")).get("package_name", "")
+        if ext == ".apk":
+            with zipfile.ZipFile(path) as z:
+                if name := axml_package(z.read("AndroidManifest.xml")):
+                    return name
         if ext == ".apk" and (tool := _build_tool("aapt2")):
             proc = await procs.exec_async(
                 tool, "dump", "packagename", str(path),

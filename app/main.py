@@ -75,9 +75,11 @@ async def watch_loop():
                 continue
 
             async def work(job, dest=dest, name=f.name):
-                job.message = f"Installing {name}…"
                 try:
+                    await ensure_ready(job)
+                    job.message = f"Installing {name}…"
                     job.results.append({"label": name, **await installer.verify_and_install(dest, None, False)})
+                    await _launch_last(job, True)
                 except Exception as e:
                     _fail(job, name, e)
             manager.start("install", f"Install downloaded {f.name}", work)
@@ -203,6 +205,19 @@ def _fail(job, label, e):
     job.results.append({"label": label, "ok": False, "error": str(e)})
 
 
+async def ensure_ready(job):
+    """Make sure a device is there to install onto: boot the bundled emulator if nothing is connected."""
+    if (await adb.status())["connected"]:
+        return
+    if not emulator.installed():
+        raise adb.AdbError("no device is connected and the Android emulator is not set up "
+                           "(run full_install.py, or connect a phone with USB debugging)")
+    job.message = "Starting the Android emulator (the first boot can take a minute or two)…"
+    await asyncio.to_thread(emulator.controller.start)
+    await emulator.wait_boot(ctl=emulator.controller)   # also points this job at the emulator
+    job.message = ""
+
+
 # ---------- models ----------
 
 class Item(BaseModel):
@@ -212,7 +227,7 @@ class Item(BaseModel):
 
 class BatchReq(BaseModel):
     items: list[Item]
-    run_last: bool = False
+    run_last: bool = True       # open the app on the device once it is installed
     allow_unsafe: bool = False
 
 
@@ -313,6 +328,7 @@ async def job_cancel(job_id: str):
 
 def _install_job(items: list[Item], run_last: bool, allow_unsafe: bool):
     async def work(job):
+        await ensure_ready(job)
         n = len(items)
         for i, item in enumerate(items):
             base = i / n
@@ -355,7 +371,7 @@ async def install_batch(req: BatchReq):
 
 @app.post("/api/upload", dependencies=[Depends(auth)])
 async def upload(files: list[UploadFile] = File(...), split: bool = Form(False),
-                 run: bool = Form(False), allow_unsafe: bool = Form(False)):
+                 run: bool = Form(True), allow_unsafe: bool = Form(False)):
     """Install uploaded .apk/.xapk/.apks/.aab files.
 
     split=false: each file is its own app.  split=true: the .apk files are the
@@ -383,6 +399,7 @@ async def upload(files: list[UploadFile] = File(...), split: bool = Form(False),
         raise HTTPException(400, "split mode only takes .apk files")
 
     async def work(job):
+        await ensure_ready(job)
         groups = [saved] if split else [[p] for p in saved]
         for gi, g in enumerate(groups):
             label = ", ".join(p.name.split("_", 1)[1] for p in g)
@@ -498,6 +515,32 @@ async def get_apk(apk_id: str, name: str):
     if f.parent != d or not f.is_file():
         raise HTTPException(404, "not found")
     return FileResponse(f, filename=name)
+
+
+@app.post("/api/apks/{apk_id}/install", dependencies=[Depends(auth)])
+async def install_stored(apk_id: str):
+    """Install a stored download/upload (all its .apk files together if it is a split set) and open it."""
+    d = _lib_dir(apk_id)
+    files = sorted(f for f in d.iterdir() if f.is_file() and f.suffix.lower() in ARCHIVE_EXTS)
+    if not files:
+        raise HTTPException(400, "no installable file in this entry")
+    label = ", ".join(f.name for f in files)
+
+    async def work(job):
+        await ensure_ready(job)
+        job.message = f"Installing {label}…"
+        try:
+            if len(files) > 1 and all(f.suffix.lower() == ".apk" for f in files):
+                pkg = await installer.install_artifact(files[0], split_group=files)
+                res = {"ok": True, "package": pkg}
+            else:
+                res = await installer.verify_and_install(files[0], None, False, label=label)
+            job.results.append({"label": label, **res})
+        except Exception as e:
+            _fail(job, label, e)
+        await _launch_last(job, True)
+        job.message = ""
+    return {"job": manager.start("install", f"Install and run {label}", work).id}
 
 
 @app.delete("/api/apks/{apk_id}", dependencies=[Depends(auth)])
@@ -755,9 +798,14 @@ async def emulator_stop():
 
 
 @app.post("/api/emulator/setup", dependencies=[Depends(auth)])
-async def emulator_setup():
-    """Download Java, the Android SDK, a system image and create the virtual device."""
+async def emulator_setup(playstore: bool | None = None):
+    """Download Java, the Android SDK, a system image and create the virtual device.
+    playstore=true uses the image that includes Google Play (you sign in yourself; not rootable)."""
+    if playstore is not None:
+        settings.save(playstore=playstore)
+
     async def work(job):
+        await asyncio.to_thread(emulator.controller.stop)
         loop = asyncio.get_running_loop()
 
         def log(msg):
@@ -910,8 +958,10 @@ async def history_retry(entry_id: str):
         raise HTTPException(400, "the stored file has been cleaned up; upload it again")
 
     async def work(job):
+        await ensure_ready(job)
         job.message = f"Installing {f.name}…"
         job.results.append({"label": e["label"], **await installer.verify_and_install(f, None, False, label=e["label"])})
+        await _launch_last(job, True)
         job.message = ""
     return {"job": manager.start("install", f"Retry {e['label']}", work).id}
 

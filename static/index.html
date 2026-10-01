@@ -45,7 +45,7 @@ canvas{max-width:100%;max-height:72vh;background:#fff;border:1px solid var(--lin
   <div class="row"><select id="prov"></select><input id="q" placeholder="Search apps…"><button id="go">Search</button></div>
   <div id="results"></div>
   <button class="primary" id="installSel">Install selected</button>
-  <label><input type="checkbox" id="runLast"> launch last</label>
+  <label><input type="checkbox" id="runLast" checked> open the app after installing</label>
   <h3>Other stores (open in your browser)</h3>
   <div class="row" id="browse" style="flex-wrap:wrap"></div>
   <label><input type="checkbox" id="watch"> auto-install APKs I download <small id="watchdir"></small></label>
@@ -61,7 +61,7 @@ canvas{max-width:100%;max-height:72vh;background:#fff;border:1px solid var(--lin
  <div class="pane" id="p-upload">
   <input type="file" id="files" accept=".apk,.xapk,.apks,.aab" multiple>
   <p><label><input type="checkbox" id="split"> the .apk files are split APKs of ONE app</label><br>
-  <label><input type="checkbox" id="runUp"> launch after install</label></p>
+  <label><input type="checkbox" id="runUp" checked> open the app after installing</label></p>
   <button class="primary" id="doUpload">Install</button> <progress id="upProg" value="0" max="1" style="display:none;width:120px"></progress>
  </div>
 
@@ -111,6 +111,7 @@ Add "continue":true to a step to keep going after it fails.</pre></details>
   <h3>Emulators <small id="emuMax"></small></h3>
   <div id="emus"></div>
   <div class="row"><input id="newEmu" placeholder="new emulator name"><button id="mkEmu">Create</button><button id="emuSetup">Set up / repair</button></div>
+  <label><input type="checkbox" id="emuPlay"> include Google Play (sign in with your Google account inside the emulator)</label>
   <h3>Snapshots <small>(emulator)</small></h3>
   <div class="row"><input id="snapName" placeholder="snapshot name"><button id="snapSave">Save</button></div><div id="snaps"></div>
   <h3>Network</h3>
@@ -178,7 +179,8 @@ async function refreshJobs(){
       ${x.status=='running'||x.status=='queued'?`<progress value="${x.progress}" max="1"></progress><div>${esc(x.message)} <button data-cancel="${x.id}">Cancel</button></div>`:''}
       ${x.status=='error'&&x.message?`<div class="bad">${esc(x.message)}</div>`:''}${res}</div>`}).join('');
   const active=jobs.some(x=>x.status=='running'||x.status=='queued');
-  if(!active&&poll){clearInterval(poll);poll=null;loadApps();checkUpdates();loadHist();loadDevices()}
+  if(!active&&poll){clearInterval(poll);poll=null;loadApps();checkUpdates();loadHist();loadDevices();
+    if(jobs[0]&&jobs[0].kind=='install'&&jobs[0].results.some(r=>r.ok&&r.package&&!r.launch_error)){cv.scrollIntoView({block:'nearest',behavior:'smooth'});cv.focus({preventScroll:true})}}
 }
 
 $('#jobs').addEventListener('click',e=>{const b=e.target.closest('[data-cancel]');if(b)post('/api/jobs/'+b.dataset.cancel+'/cancel').catch(()=>{})});
@@ -201,12 +203,12 @@ $('#go').onclick=async()=>{$('#results').textContent='Searching…';
    $('#results').innerHTML=apps.map(a=>`<label class="item"><input type="checkbox" data-p="${esc(a.provider)}" data-id="${esc(a.id)}">
     ${a.icon?`<img src="${esc(a.icon)}" alt="">`:''}<span class="t">${esc(a.name)}<small><br>${esc(a.id)} ${esc(a.version)}</small></span></label>`).join('')||'No results'}
   catch(e){$('#results').textContent=e.message}};
-$('#q').onkeydown=e=>e.key=='Enter'&&$('#go').click();
+$('#q').addEventListener('keydown',e=>{if(e.key=='Enter')$('#go').click()});   // never return false from a key handler: it cancels typing
 async function batch(items,run){try{watch((await post('/api/install',{items,run_last:run,allow_unsafe:$('#unsafe').checked})).job)}catch(e){say('✘ '+e.message)}}
 $('#installSel').onclick=()=>{const items=[...document.querySelectorAll('#results input:checked')].map(c=>({provider:c.dataset.p,id:c.dataset.id}));
   items.length?batch(items,$('#runLast').checked):say('Select at least one app')};
 $('#installUrls').onclick=()=>{const items=$('#urls').value.split('\n').map(s=>s.trim()).filter(Boolean).map(id=>({provider:'direct',id}));
-  items.length&&batch(items,false)};
+  items.length&&batch(items,$('#runLast').checked)};
 
 /* ---------- upload (with real upload progress) ---------- */
 $('#doUpload').onclick=()=>{const fs=$('#files').files;if(!fs.length)return say('Choose files');
@@ -246,17 +248,19 @@ $('#upd').onclick=async e=>{const b=e.target.closest('button');if(b)try{watch((a
 /* ---------- stored APK files ---------- */
 async function loadLib(){const l=await j('/api/apks');
   $('#lib').innerHTML=l.map(d=>`<div class="item"><span class="t">${d.files.map(f=>esc(f.name)+` <small>${(f.size/1048576).toFixed(1)} MB</small>`).join('<br>')}</span>
+   <button class="primary" data-a="run" data-id="${d.id}">Install &amp; run</button>
    <button data-a="dl" data-id="${d.id}" data-n="${esc(d.files[0]?.name||'')}">Copy</button>
    <button class="danger" data-a="del" data-id="${d.id}">Delete</button></div>`).join('')||'No stored files (old ones are removed automatically after 7 days)'}
 $('#lib').onclick=async e=>{const b=e.target.closest('button');if(!b)return;
-  try{if(b.dataset.a=='dl')await saveBlob(`/api/apks/${b.dataset.id}/${encodeURIComponent(b.dataset.n)}`,b.dataset.n);
+  try{if(b.dataset.a=='run')watch((await post(`/api/apks/${b.dataset.id}/install`)).job);
+   else if(b.dataset.a=='dl')await saveBlob(`/api/apks/${b.dataset.id}/${encodeURIComponent(b.dataset.n)}`,b.dataset.n);
    else if(confirm('Delete this file?')){await j('/api/apks/'+b.dataset.id,{method:'DELETE'});loadLib()}}
   catch(err){say('✘ '+err.message)}};
 $('#refLib').onclick=loadLib;
 
 /* ---------- device: emulator, rotate, screenshot, files, backups ---------- */
-$('#emuSetup').onclick=async()=>{if(confirm('Downloads Java + Android SDK + a system image (~2 GB) and accepts the Android SDK license (developer.android.com/studio/terms). Continue?'))
-  try{watch((await post('/api/emulator/setup')).job)}catch(e){say('✘ '+e.message)}};
+$('#emuSetup').onclick=async()=>{if(confirm('Downloads Java + Android SDK + a system image (~2 GB) and accepts the Android SDK license (developer.android.com/studio/terms)'+($('#emuPlay').checked?'. The emulator will be rebuilt WITH Google Play (no app-data backup on that image)':'')+'. Continue?'))
+  try{watch((await post('/api/emulator/setup?playstore='+$('#emuPlay').checked)).job)}catch(e){say('✘ '+e.message)}};
 let rot=0;const doRot=d=>{rot=(rot+d+4)%4;send({type:'rotate',rotation:rot})};
 $('#rotL').onclick=()=>doRot(-1);$('#rotR').onclick=()=>doRot(1);
 $('#shot').onclick=()=>saveBlob('/api/screenshot','screenshot.png').catch(e=>say('✘ '+e.message));
