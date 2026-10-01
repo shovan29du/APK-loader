@@ -3,10 +3,17 @@
     python run.py                    run the server (auto-starts the emulator if installed)
     python run.py --hardware         show detected hardware and the tuned settings
     python run.py --setup-emulator   download Java + Android SDK + emulator + bundletool
+    python run.py --app com.x.y      open one Android app (what the app shortcuts run)
+    python run.py --install a.apk    install the file(s) and open the app ("Open with" / double-click)
+
+Only one APK Loader runs per user: starting it again reuses the running server.
 """
+import atexit
 import json
+import mimetypes
 import os
 import socket
+import uuid
 import sys
 import threading
 import time
@@ -43,20 +50,85 @@ def pick_port(host: str, preferred: int) -> int:
                      "Set APKLOADER_PORT to a free port.")
 
 
-def open_when_ready(host: str, port: int):
+def server_file():
+    from app import config
+    return config.DATA_DIR / "server.json"
+
+
+def is_ours(host: str, port: int) -> bool:
+    try:
+        with urllib.request.urlopen(f"http://{host}:{port}/api/health", timeout=1.5) as r:
+            return json.load(r).get("app") == "apk-loader"
+    except Exception:
+        return False
+
+
+def running_port(host: str):
+    """Port of an APK Loader already running for this user, or None (stale files are ignored)."""
+    try:
+        port = json.loads(server_file().read_text())["port"]
+    except (OSError, ValueError, KeyError):
+        return None
+    return port if is_ours(host, port) else None
+
+
+def _request(host, port, method, path, body=None, headers=None):
+    h = dict(headers or {})
+    if os.getenv("API_TOKEN"):
+        h["Authorization"] = "Bearer " + os.environ["API_TOKEN"]
+    req = urllib.request.Request(f"http://{host}:{port}{path}", data=body, method=method, headers=h)
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.load(r)
+
+
+def multipart(files):
+    """Minimal multipart/form-data body: the files plus run=true (open the app afterwards)."""
+    boundary = uuid.uuid4().hex
+    parts = []
+    for path in files:
+        name = os.path.basename(path)
+        ctype = mimetypes.guess_type(name)[0] or "application/octet-stream"
+        with open(path, "rb") as f:
+            parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="files"; filename="{name}"\r\n'
+                         f"Content-Type: {ctype}\r\n\r\n".encode() + f.read() + b"\r\n")
+    parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="run"\r\n\r\ntrue\r\n'.encode())
+    parts.append(f"--{boundary}--\r\n".encode())
+    return b"".join(parts), f"multipart/form-data; boundary={boundary}"
+
+
+def do_requests(host, port, app_pkg=None, install=()):
+    """Tell the running server what the command line asked for."""
+    try:
+        if install:
+            body, ctype = multipart(install)
+            _request(host, port, "POST", "/api/upload", body, {"Content-Type": ctype})
+        elif app_pkg:
+            _request(host, port, "POST", f"/api/apps/{app_pkg}/open", b"")
+    except Exception as e:
+        print(f"Could not hand the request to APK Loader: {e}", flush=True)
+
+
+def open_when_ready(host: str, port: int, app_pkg=None, install=()):
     """Open the browser only once /api/health proves this really is APK Loader."""
     url = f"http://{host}:{port}"
     for _ in range(120):
-        try:
-            with urllib.request.urlopen(url + "/api/health", timeout=1) as r:
-                if json.load(r).get("app") == "apk-loader":
-                    print(f"APK Loader is running at {url}", flush=True)
-                    webbrowser.open(url)
-                    return
-        except Exception:
-            pass
+        if is_ours(host, port):
+            print(f"APK Loader is running at {url}", flush=True)
+            do_requests(host, port, app_pkg, install)
+            webbrowser.open(url)
+            return
         time.sleep(0.5)
     print(f"APK Loader did not answer at {url}", flush=True)
+
+
+def parse_cli(argv):
+    app_pkg, files = None, []
+    if "--app" in argv and argv.index("--app") + 1 < len(argv):
+        app_pkg = argv[argv.index("--app") + 1]
+    if "--install" in argv:
+        files = [os.path.abspath(a) for a in argv[argv.index("--install") + 1:]
+                 if not a.startswith("--") and os.path.isfile(a)]
+    return app_pkg, files
 
 
 def main():
@@ -91,10 +163,21 @@ def main():
         if d.is_dir():
             os.environ["PATH"] = str(d) + os.pathsep + os.environ.get("PATH", "")
             break
+    app_pkg, files = parse_cli(sys.argv)
+    if app_pkg and not __import__("re").fullmatch(r"[A-Za-z][\w]*(\.[A-Za-z_][\w]*)+", app_pkg):
+        raise SystemExit(f"Not a valid Android package name: {app_pkg}")
+    existing = running_port(HOST)
+    if existing:                                  # one instance per user: reuse the running server
+        print(f"APK Loader is already running at http://{HOST}:{existing}", flush=True)
+        do_requests(HOST, existing, app_pkg, files)
+        webbrowser.open(f"http://{HOST}:{existing}")
+        return
     port = pick_port(HOST, PORT)
     if port != PORT:
         print(f"Port {PORT} is already in use by another program; using {port} instead.", flush=True)
-    threading.Thread(target=open_when_ready, args=(HOST, port), daemon=True).start()
+    server_file().write_text(json.dumps({"port": port, "pid": os.getpid()}))
+    atexit.register(lambda: server_file().unlink(missing_ok=True))
+    threading.Thread(target=open_when_ready, args=(HOST, port, app_pkg, files), daemon=True).start()
     import uvicorn
     from app.main import app
     uvicorn.run(app, host=HOST, port=port, log_level="info",

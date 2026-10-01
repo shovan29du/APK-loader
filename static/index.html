@@ -31,6 +31,7 @@ body.wide main{grid-template-columns:1fr}body.wide #side{display:none}body.wide 
 #logbox{height:200px;overflow:auto;background:#0d1117;color:#c9d1d9;font:11px/1.35 ui-monospace,monospace;padding:6px;border-radius:6px;white-space:pre-wrap}
 #logbox .E,#logbox .F{color:#f87171}#logbox .W{color:#fbbf24}#logbox .I{color:#60a5fa}
 .bar{height:8px;background:var(--line);border-radius:4px;overflow:hidden}.bar>i{display:block;height:100%;background:var(--accent)}
+body.dropping::after{content:'Drop APK files to install';position:fixed;inset:0;display:flex;align-items:center;justify-content:center;font-size:28px;background:rgba(37,99,235,.18);border:4px dashed var(--accent);pointer-events:none;z-index:9}
 canvas{max-width:100%;max-height:72vh;background:#fff;border:1px solid var(--line);border-radius:8px;touch-action:none;cursor:pointer}
 #status{font-size:12px;opacity:.75}
 </style></head><body><main>
@@ -184,6 +185,16 @@ async function refreshJobs(){
 }
 
 $('#jobs').addEventListener('click',e=>{const b=e.target.closest('[data-cancel]');if(b)post('/api/jobs/'+b.dataset.cancel+'/cancel').catch(()=>{})});
+/* ---------- drag & drop: drop .apk / .xapk / .apks / .aab anywhere on the page ---------- */
+document.addEventListener('dragover',e=>{if([...e.dataTransfer.types].includes('Files')){e.preventDefault();document.body.classList.add('dropping')}});
+document.addEventListener('dragleave',e=>{if(!e.relatedTarget)document.body.classList.remove('dropping')});
+document.addEventListener('drop',e=>{e.preventDefault();document.body.classList.remove('dropping');
+  const fs=[...e.dataTransfer.files].filter(f=>/\.(apk|xapk|apks|aab)$/i.test(f.name));
+  if(!fs.length)return say('Drop .apk, .xapk, .apks or .aab files');
+  const fd=new FormData();fs.forEach(f=>fd.append('files',f));fd.append('run','true');fd.append('allow_unsafe',$('#unsafe').checked);
+  const x=new XMLHttpRequest();x.open('POST','/api/upload');if(token)x.setRequestHeader('Authorization','Bearer '+token);if(dev)x.setRequestHeader('X-Device',dev);
+  x.onload=()=>{let d={};try{d=JSON.parse(x.responseText)}catch{}x.status==200?watch(d.job):say('✘ '+(d.detail||x.statusText))};
+  x.onerror=()=>say('✘ upload failed');say('Uploading '+fs.length+' file(s)…');x.send(fd)});
 /* ---------- tabs ---------- */
 const tabs=[['market','Marketplaces'],['url','URLs'],['upload','Upload'],['apps','Installed'],['upd','Updates'],['hist','History'],['scr','Scripts'],['lib','APK files'],['dbg','Debug'],['dev','Device']];
 tabs.forEach(([id,l],i)=>{const b=document.createElement('button');b.textContent=l;b.id='tab-'+id;b.onclick=()=>{
@@ -225,10 +236,18 @@ async function loadApps(){const ps=await j('/api/apps').catch(()=>[]);
   $('#apps').innerHTML=ps.map(p=>`<div class="item"><span class="t">${esc(p)}</span>
    <button data-a="launch" data-p="${esc(p)}">Run</button><button data-a="copy" data-p="${esc(p)}">Copy APK</button>
    <button data-a="backup" data-p="${esc(p)}">Backup</button>
-   <button class="danger" data-a="uninstall" data-p="${esc(p)}">Uninstall</button></div>`).join('')||'No user apps installed'}
+   <button class="danger" data-a="uninstall" data-p="${esc(p)}">Uninstall</button>
+   <details style="width:100%"><summary><small>more</small></summary><div class="row" style="flex-wrap:wrap">
+    <button data-a="stop" data-p="${esc(p)}">Force stop</button><button data-a="info" data-p="${esc(p)}">Info</button>
+    <button data-a="shortcut" data-p="${esc(p)}" title="Desktop and Start-menu shortcut that opens this app">Desktop shortcut</button>
+    <button class="danger" data-a="clear" data-p="${esc(p)}">Clear data</button></div></details></div>`).join('')||'No user apps installed'}
 $('#apps').onclick=async e=>{const b=e.target.closest('button');if(!b)return;const p=b.dataset.p;
   try{if(b.dataset.a=='launch'){await post('/api/launch',{package:p});say('Launched '+p)}
    else if(b.dataset.a=='copy'){await saveBlob(`/api/apps/${p}/apk`,p+'.apk')}
+   else if(b.dataset.a=='stop'){await post(`/api/apps/${p}/stop`);say('Stopped '+p)}
+   else if(b.dataset.a=='info'){const i=await j(`/api/apps/${p}/info`);say(`${p}: version ${i.version_name} (${i.version_code}), target SDK ${i.target_sdk}, installed ${i.installed}, updated ${i.updated}`)}
+   else if(b.dataset.a=='shortcut'){const r=await post(`/api/apps/${p}/shortcut`,{label:p.split('.').pop()});say('Shortcut created: '+r.created.join(', '))}
+   else if(b.dataset.a=='clear'){if(confirm('Erase all data of '+p+'? (the app stays installed)')){await post(`/api/apps/${p}/clear`);say('Cleared data of '+p)}}
    else if(b.dataset.a=='backup'){say('Backing up…');const r=await post('/api/backups',{package:p});say('Backup saved: '+r.name)}
    else if(confirm('Uninstall '+p+'?')){await post('/api/uninstall',{package:p});say('Uninstalled '+p);loadApps()}}
   catch(err){say('✘ '+err.message)}};

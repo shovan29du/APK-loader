@@ -45,6 +45,10 @@ elif a[:2] == ["shell", "dumpsys window displays | grep -m1 'cur='"]:
     print("  init=1080x2400 420dpi cur=1080x2400 app=1080x2400 rng=1080x1008-2400x2328")
 elif a[:2] == ["shell", "dumpsys window | grep -E 'mCurrentFocus|mFocusedApp' | head -3"]:
     print("  mCurrentFocus=Window{1a2b u0 com.example.app/com.example.app.MainActivity}")
+elif len(a) == 2 and a[0] == "shell" and a[1].startswith("dumpsys package "):
+    print("    versionCode=42 minSdk=24 targetSdk=34\n    versionName=2.5.1\n    firstInstallTime=2026-09-01 10:00:00\n    lastUpdateTime=2026-09-20 11:30:00\n    installerPackageName=com.android.vending")
+elif a[:3] == ["shell", "pm", "clear"]:
+    print("Success")
 elif a[:2] == ["shell", "getevent"]:
     print('add device 1: /dev/input/event2\n  name:     "virtio_input_multi_touch_1"\n  events:\n    ABS (0003): ABS_MT_SLOT : value 0, min 0, max 9, fuzz 0\n'
           '                ABS_MT_POSITION_X : value 0, min 0, max 32767, fuzz 0, flat 0, resolution 0\n'

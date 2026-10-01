@@ -372,3 +372,40 @@ async def emu(*args: str) -> str:
     if re.search(r"^KO", out, re.M):
         raise AdbError(out.strip())
     return out
+
+
+# ---------- per-app management (WSA-Toolbox style) ----------
+
+async def force_stop(package: str):
+    if not valid_package(package):
+        raise AdbError("invalid package name")
+    await _dev("shell", "am", "force-stop", package)
+
+
+async def clear_data(package: str):
+    """Wipe an app's data and cache (like Settings > Storage > Clear). The app stays installed."""
+    if not valid_package(package):
+        raise AdbError("invalid package name")
+    out = await _dev("shell", "pm", "clear", package)
+    if "Success" not in out:
+        raise AdbError(out.strip() or "could not clear data")
+
+
+def parse_package_info(dump: str) -> dict:
+    def grab(key):
+        m = re.search(rf"{key}=(\S+)", dump)
+        return m.group(1) if m else ""
+    return {"version_name": grab("versionName"), "version_code": grab("versionCode"),
+            "target_sdk": grab("targetSdk"), "installed": grab("firstInstallTime"),
+            "updated": grab("lastUpdateTime"), "installer": grab("installerPackageName")}
+
+
+async def package_info(package: str) -> dict:
+    if not valid_package(package):
+        raise AdbError("invalid package name")
+    out = await _dev("shell", f"dumpsys package {package} | grep -E "
+                              "'versionName=|versionCode=|targetSdk=|firstInstallTime=|lastUpdateTime=|installerPackageName='")
+    info = parse_package_info(out)
+    if not info["version_name"] and not info["version_code"]:
+        raise AdbError(f"{package} is not installed")
+    return info

@@ -4,6 +4,8 @@ import logging
 import os
 import secrets
 import shutil
+import subprocess
+import sys
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -19,7 +21,7 @@ from pydantic import BaseModel
 from starlette.background import BackgroundTask
 
 from . import (__version__, adb, config, devices, emulator, history, inputs, installer, plugins, registry,
-               safety, scripts, scrcpy, settings, updates, video, watcher)
+               safety, scripts, scrcpy, settings, shortcuts, updates, video, watcher)
 from .remote import RemoteControl
 from .jobs import manager
 from .providers import ARCHIVE_EXTS, PROVIDERS, check_public_url, safe_filename
@@ -209,6 +211,14 @@ async def ensure_ready(job):
     """Make sure a device is there to install onto: boot the bundled emulator if nothing is connected."""
     if (await adb.status())["connected"]:
         return
+    if sys.platform == "win32":                       # Windows Subsystem for Android, if it happens to be running
+        try:
+            await devices.connect_wifi("127.0.0.1", 58526)
+            adb.use_serial("127.0.0.1:58526")
+            if (await adb.status())["connected"]:
+                return
+        except adb.AdbError:
+            pass
     if not emulator.installed():
         raise adb.AdbError("no device is connected and the Android emulator is not set up "
                            "(run full_install.py, or connect a phone with USB debugging)")
@@ -449,6 +459,69 @@ async def uninstall(p: Pkg):
         raise HTTPException(400, str(e))
     registry.forget(p.package)
     return {"ok": True}
+
+
+def _pkg(package: str) -> str:
+    if not adb.valid_package(package):
+        raise HTTPException(400, "invalid package name")
+    return package
+
+
+@app.post("/api/apps/{package}/open", dependencies=[Depends(auth)])
+async def app_open(package: str):
+    """Boot the emulator if needed, then open the app (what the app shortcuts call)."""
+    _pkg(package)
+
+    async def work(job):
+        await ensure_ready(job)
+        job.message = f"Opening {package}…"
+        try:
+            await adb.launch(package)
+            job.results.append({"ok": True, "label": f"opened {package}", "package": package})
+        except adb.AdbError as e:
+            _fail(job, package, e)
+        job.message = ""
+    return {"job": manager.start("open", f"Open {package}", work).id}
+
+
+@app.post("/api/apps/{package}/stop", dependencies=[Depends(auth)])
+async def app_stop(package: str):
+    try:
+        await adb.force_stop(_pkg(package))
+    except adb.AdbError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True}
+
+
+@app.post("/api/apps/{package}/clear", dependencies=[Depends(auth)])
+async def app_clear(package: str):
+    try:
+        await adb.clear_data(_pkg(package))
+    except adb.AdbError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True}
+
+
+@app.get("/api/apps/{package}/info", dependencies=[Depends(auth)])
+async def app_info(package: str):
+    try:
+        return await adb.package_info(_pkg(package))
+    except adb.AdbError as e:
+        raise HTTPException(400, str(e))
+
+
+class Shortcut(BaseModel):
+    label: str = ""
+
+
+@app.post("/api/apps/{package}/shortcut", dependencies=[Depends(auth)])
+async def app_shortcut(package: str, s: Shortcut):
+    """Put a desktop / Start-menu shortcut on the laptop that opens this Android app."""
+    try:
+        made = await asyncio.to_thread(shortcuts.create, _pkg(package), s.label)
+    except (adb.AdbError, OSError, subprocess.SubprocessError) as e:
+        raise HTTPException(400, f"could not create the shortcut: {e}")
+    return {"created": made}
 
 
 @app.get("/api/apps/{package}/apk", dependencies=[Depends(auth)])

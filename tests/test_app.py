@@ -950,3 +950,126 @@ def test_reinstalling_an_installed_app_still_opens_it(client, monkeypatch):
     j = upload(client, [("hello.apk", b.getvalue())])
     assert j["results"][0]["ok"] and j["results"][0]["package"] == "com.example.hello"
     assert launched == ["com.example.hello"]
+
+
+# ---------------- app management, shortcuts, launcher (WSATools-style abilities) ----------------
+def test_app_management_endpoints(tmp_path, fake_adb, monkeypatch):
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(config, "DOWNLOAD_DIR", tmp_path / "dl")
+    (tmp_path / "dl").mkdir()
+    with TestClient(main.app, base_url="http://localhost") as c:
+        info = c.get("/api/apps/com.example.app/info").json()
+        assert info["version_name"] == "2.5.1" and info["version_code"] == "42" and info["target_sdk"] == "34"
+        assert info["installer"] == "com.android.vending"
+        assert c.post("/api/apps/com.example.app/stop").status_code == 200
+        assert c.post("/api/apps/com.example.app/clear").status_code == 200
+        log = fake_adb.read_text()
+        assert "am force-stop com.example.app" in log and "pm clear com.example.app" in log
+        for bad in ("x;reboot", "no_dots", "a.b;rm"):
+            assert c.post(f"/api/apps/{bad}/stop").status_code in (400, 404, 422)
+            assert c.get(f"/api/apps/{bad}/info").status_code in (400, 404, 422)
+        job = wait_job(c, c.post("/api/apps/com.example.app/open").json()["job"])
+        assert job["status"] == "done" and "monkey -p com.example.app" in fake_adb.read_text()
+
+
+def test_app_shortcut_created_on_desktop(tmp_path, monkeypatch):
+    from app import shortcuts
+    home = tmp_path / "home"
+    (home / "Desktop").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(shortcuts, "WIN", False)
+    monkeypatch.setattr("sys.platform", "linux")
+    made = shortcuts.create("com.example.app", 'My: "Game"/x')
+    text = (home / "Desktop" / 'My_ _Game__x (Android).desktop').read_text()
+    assert "--app" in text and "com.example.app" in text and "run.py" in text and "Terminal=false" in text
+    assert any(m.startswith(str(home / ".local/share/applications")) for m in made)
+    with pytest.raises(adb.AdbError):
+        shortcuts.create("bad;name")
+    assert shortcuts.safe_label('a<b>:"c"') == "a_b___c_"
+
+
+def test_shortcut_endpoint_rejects_bad_package(client):
+    assert client.post("/api/apps/not_a_package/shortcut", json={"label": "x"}).status_code in (400, 404)
+
+
+def test_launcher_cli_parsing_and_multipart(tmp_path):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("run_mod", pathlib_path("run.py"))
+    run_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(run_mod)
+    f = tmp_path / "x.apk"
+    f.write_bytes(b"PK-data")
+    assert run_mod.parse_cli(["run.py", "--app", "com.a.b"]) == ("com.a.b", [])
+    assert run_mod.parse_cli(["run.py", "--install", str(f), "missing.apk", "--x"]) == (None, [str(f)])
+    assert run_mod.parse_cli(["run.py"]) == (None, [])
+    body, ctype = run_mod.multipart([str(f)])
+    boundary = ctype.split("boundary=")[1].encode()
+    assert b'name="files"; filename="x.apk"' in body and b"PK-data" in body and b'name="run"' in body
+    assert body.rstrip().endswith(b"--" + boundary + b"--")
+
+
+def pathlib_path(name):
+    import pathlib
+    return str(pathlib.Path(__file__).parent.parent / name)
+
+
+def test_second_launch_reuses_running_server_and_hands_over_app_and_files(tmp_path, fake_adb):
+    """Real processes: start APK Loader, then `run.py --app ...` and `run.py --install ...` must reuse it."""
+    import socket
+    import subprocess
+    import sys
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    env = {**os.environ, "APKLOADER_HOME": str(tmp_path), "APKLOADER_PORT": str(port), "BROWSER": "true",
+           "ADB_BIN": str(fake_adb.parent / "adb"), "FAKE_ADB_LOG": str(fake_adb), "SCRCPY": "0"}
+    run_py = pathlib_path("run.py")
+    server = subprocess.Popen([sys.executable, run_py], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        info = tmp_path / "server.json"
+        end = time.time() + 20
+        while time.time() < end and not info.exists():
+            time.sleep(0.2)
+        assert info.exists()
+        time.sleep(1.5)
+        r = subprocess.run([sys.executable, run_py, "--app", "com.example.app"], env=env, capture_output=True, text=True, timeout=30)
+        assert "already running" in r.stdout
+        apk = tmp_path / "hello.apk"
+        apk.write_bytes(make_apk())
+        r = subprocess.run([sys.executable, run_py, "--install", str(apk)], env=env, capture_output=True, text=True, timeout=30)
+        assert "already running" in r.stdout
+        end = time.time() + 15
+        log = ""
+        while time.time() < end:
+            log = fake_adb.read_text() if fake_adb.exists() else ""
+            if "monkey -p com.example.app" in log and "install -r -g" in log:
+                break
+            time.sleep(0.3)
+        assert "monkey -p com.example.app" in log, log[-500:]       # --app opened the app
+        assert "install -r -g" in log                                # --install installed the file
+        assert json.loads(info.read_text())["port"] == port          # still the one original server
+    finally:
+        server.terminate()
+        server.wait(10)
+
+
+@pytest.mark.asyncio
+async def test_wsa_is_used_when_running_on_windows(monkeypatch):
+    from app import devices, emulator
+
+    async def status():
+        return {"connected": adb.serial() == "127.0.0.1:58526"}
+
+    async def connect_wifi(host, port):
+        return f"{host}:{port}"
+    monkeypatch.setattr(main.sys, "platform", "win32")
+    monkeypatch.setattr(adb, "status", status)
+    monkeypatch.setattr(devices, "connect_wifi", connect_wifi)
+    monkeypatch.setattr(emulator, "installed", lambda: False)
+
+    class J:
+        message = ""
+    await main.ensure_ready(J())                      # would raise "no emulator" if WSA weren't tried first
+    assert adb.serial() == "127.0.0.1:58526"
+    adb.use_serial(None)

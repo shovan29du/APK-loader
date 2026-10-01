@@ -22,6 +22,15 @@ Name: "{group}\APK Loader"; Filename: "{app}\APKLoader.exe"
 Name: "{userdesktop}\APK Loader"; Filename: "{app}\APKLoader.exe"
 Name: "{%USERPROFILE}\Desktop\APK Loader"; Filename: "{app}\APKLoader.exe"; Check: PlainDesktopDiffers
 
+[Registry]
+Root: HKCU; Subkey: "Software\Classes\APKLoader.AndroidPackage"; ValueType: string; ValueData: "Android package (APK Loader)"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\APKLoader.AndroidPackage\shell\open"; ValueType: string; ValueData: "Install with APK Loader"
+Root: HKCU; Subkey: "Software\Classes\APKLoader.AndroidPackage\shell\open\command"; ValueType: string; ValueData: """{app}\APKLoader.exe"" --install ""%1"""
+Root: HKCU; Subkey: "Software\Classes\.apk\OpenWithProgids"; ValueType: none; ValueName: "APKLoader.AndroidPackage"; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\Classes\.xapk\OpenWithProgids"; ValueType: none; ValueName: "APKLoader.AndroidPackage"; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\Classes\.apks\OpenWithProgids"; ValueType: none; ValueName: "APKLoader.AndroidPackage"; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\Classes\.aab\OpenWithProgids"; ValueType: none; ValueName: "APKLoader.AndroidPackage"; Flags: uninsdeletevalue
+
 [Run]
 Filename: "{app}\APKLoader.exe"; Description: "Launch APK Loader"; Flags: nowait postinstall skipifsilent
 

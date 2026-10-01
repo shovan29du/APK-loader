@@ -44,6 +44,13 @@ and BIOS virtualization (setup prints the exact command if acceleration is missi
 - Purges stored APK files older than 7 days.
 
 ## Features
+- **App shortcuts** (like WSATools): *Installed → more → Desktop shortcut* puts a shortcut on your Desktop (and OneDrive Desktop) and
+  Start menu that opens that one Android app: it starts APK Loader, boots the emulator if needed, and launches the app.
+- **Open with / drag-and-drop**: drop `.apk/.xapk/.apks/.aab` files on the page, or right-click a file → *Open with → Install with APK Loader*
+  (registered by the installer; the default app for APK files is not changed). `python run.py --install file.apk` does the same.
+- **One instance**: starting APK Loader again reuses the running server instead of starting a second one.
+- **App management** (like WSA Toolbox): force stop, clear data, version/install info, copy APK, back up data, uninstall.
+- **WSA**: if the (discontinued) Windows Subsystem for Android is running, it is detected on `127.0.0.1:58526` and used.
 - **Clipboard sync, audio, true multi-touch** through the official `scrcpy-server` (Genymobile, Apache-2.0). It is downloaded
   once from the upstream release, verified against a pinned SHA-256, pushed to the device and run with `app_process` (as the
   `shell` user, like scrcpy itself). Clipboard: the device clipboard flows to the browser automatically, Ctrl+V pastes any

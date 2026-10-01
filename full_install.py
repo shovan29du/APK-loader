@@ -156,15 +156,62 @@ def make_shortcuts(dest: Path) -> list[Path]:
         apps = Path.home() / ".local/share/applications"
         apps.mkdir(parents=True, exist_ok=True)
         f = apps / "apkloader.desktop"
-        f.write_text(desktop_entry(py, run_py, dest))
+        f.write_text(desktop_entry(py, run_py, dest, with_files=True))      # also offered for .apk files
         made.append(f)
     return made
 
 
-def desktop_entry(py: Path, run_py: Path, dest: Path) -> str:
+def desktop_entry(py: Path, run_py: Path, dest: Path, with_files: bool = False) -> str:
+    mime = "MimeType=application/vnd.android.package-archive;\n" if with_files else ""
+    exec_line = f'"{py}" "{run_py}" --install %F' if with_files else f'"{py}" "{run_py}"'
     return ("[Desktop Entry]\nType=Application\n"
             f"Name={APP_NAME}\nComment=Install and run Android APKs in your browser\n"
-            f'Exec="{py}" "{run_py}"\nPath={dest}\nTerminal=false\nCategories=Utility;\n')
+            f"Exec={exec_line}\nPath={dest}\nTerminal=false\nCategories=Utility;\n{mime}")
+
+
+APK_EXTS = (".apk", ".xapk", ".apks", ".aab")
+PROG_ID = "APKLoader.AndroidPackage"
+
+
+def register_open_with(dest: Path):
+    """Windows: add APK Loader to the 'Open with' list of Android package files (does not change the default app)."""
+    if SYSTEM != "Windows":
+        return
+    import winreg
+    cmd = f'"{pythonw(dest)}" "{dest / "run.py"}" --install "%1"'
+    base = r"Software\Classes"
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, rf"{base}\{PROG_ID}") as k:
+        winreg.SetValueEx(k, None, 0, winreg.REG_SZ, "Android package (APK Loader)")
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, rf"{base}\{PROG_ID}\shell\open\command") as k:
+        winreg.SetValueEx(k, None, 0, winreg.REG_SZ, cmd)
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, rf"{base}\{PROG_ID}\shell\open") as k:
+        winreg.SetValueEx(k, None, 0, winreg.REG_SZ, "Install with APK Loader")
+    for ext in APK_EXTS:
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, rf"{base}\{ext}\OpenWithProgids") as k:
+            winreg.SetValueEx(k, PROG_ID, 0, winreg.REG_NONE, b"")
+    say("Registered 'Open with > Install with APK Loader' for .apk/.xapk/.apks/.aab files.")
+
+
+def unregister_open_with():
+    if SYSTEM != "Windows":
+        return
+    import winreg
+    base = r"Software\Classes"
+    for ext in APK_EXTS:
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, rf"{base}\{ext}\OpenWithProgids", 0, winreg.KEY_SET_VALUE) as k:
+                winreg.DeleteValue(k, PROG_ID)
+        except OSError:
+            pass
+    for sub in ("shell\\open\\command", "shell\\open", "shell"):
+        try:
+            winreg.DeleteKey(winreg.HKEY_CURRENT_USER, rf"{base}\{PROG_ID}\{sub}")
+        except OSError:
+            pass
+    try:
+        winreg.DeleteKey(winreg.HKEY_CURRENT_USER, rf"{base}\{PROG_ID}")
+    except OSError:
+        pass
 
 
 # ---------------------------------------------------------------- install steps
@@ -296,6 +343,10 @@ def install(dest: Path, with_adb: bool, with_emulator: bool = True, do_launch: b
     if with_emulator:
         setup_emulator(dest)
     shortcuts = make_shortcuts(dest)
+    try:
+        register_open_with(dest)
+    except Exception as e:
+        say(f"Could not register 'Open with' ({e}); everything else works.")
     (dest / "shortcuts.txt").write_text("\n".join(map(str, shortcuts)))
     say(f"Done. Launch '{APP_NAME}' from your Desktop, or run: {venv_python(dest)} {dest / 'run.py'}")
     if not with_emulator:
@@ -326,6 +377,7 @@ def update(dest: Path, ref: str | None):
 
 
 def uninstall(dest: Path):
+    unregister_open_with()
     say("Removing shortcuts…")
     listing = dest / "shortcuts.txt"
     if listing.exists():
