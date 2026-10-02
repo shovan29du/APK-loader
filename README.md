@@ -43,6 +43,15 @@ and BIOS virtualization (setup prints the exact command if acceleration is missi
 - Checks installed marketplace apps and APK Loader itself for updates every 6 h (Updates tab, banner).
 - Purges stored APK files older than 7 days.
 
+## Performance
+- **No more 3-minute video freeze**: the live screen used to visibly stall for up to a second every 3 minutes, when
+  `screenrecord`'s hard time limit forced a stop-then-restart. The replacement process now starts ~12s early and takes
+  over the instant the old one ends, so there's no gap (a brief decoder reset still happens — new encoding session).
+- **Faster multi-app installs**: installing several apps from marketplaces/URLs now resolves and downloads them
+  concurrently (`DOWNLOAD_CONCURRENCY`, default 4) while the device installs the previous one — downloads overlap
+  with install time instead of happening one full item at a time.
+- Bigger transfer buffers (64 KB → 1 MB) for downloads and uploads, fewer round trips on large APKs.
+
 ## Features
 - **Export app data without root**: *Installed → more → Export data (no root)* uses `run-as` (debuggable apps) and the app's
   public storage folder — works on ordinary, non-rooted phones, not just the bundled rootable emulator. The full tar **Backup**

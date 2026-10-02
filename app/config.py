@@ -42,6 +42,7 @@ ALLOW_PRIVATE_URLS = os.getenv("ALLOW_PRIVATE_URLS", "") == "1"
 # Start the bundled emulator automatically when no device is reachable.
 # Use scrcpy-server for clipboard / audio / multi-touch (downloaded once, hash-pinned).
 SCRCPY = os.getenv("SCRCPY", "1") == "1"
+DOWNLOAD_CONCURRENCY = int(os.getenv("DOWNLOAD_CONCURRENCY", "4"))  # parallel marketplace/URL downloads
 AUTO_EMULATOR = os.getenv("AUTO_EMULATOR", "1") == "1"
 GITHUB_REPO = os.getenv("APKLOADER_REPO", "shovan29du/APK-loader")
 FILE_ROOTS = ["/sdcard", "/storage/emulated/0", "/data/local/tmp"]

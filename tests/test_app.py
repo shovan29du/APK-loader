@@ -1153,3 +1153,94 @@ def test_scan_and_install_endpoints(tmp_path, fake_adb, monkeypatch):
         assert job["status"] == "done" and job["results"][0]["ok"]
         assert c.post("/api/scan/install", json={"path": "/etc/passwd"}).status_code == 400
         assert c.post("/api/scan/install", json={"path": str(tmp_path / "nope.apk")}).status_code == 400
+
+
+# ---------------- speed: seamless video handoff, parallel downloads ----------------
+def test_should_prestart_timing():
+    from app.video import should_prestart
+    assert not should_prestart(0)
+    assert not should_prestart(167, time_limit=180, margin=12)
+    assert should_prestart(168, time_limit=180, margin=12)
+    assert should_prestart(180)
+
+
+@pytest.mark.asyncio
+async def test_video_handoff_has_no_gap_when_prestart_ready(monkeypatch):
+    """When a replacement process is already running, the old one's exit must not be followed by
+    a fresh spawn+sleep (that's the stutter this change removes)."""
+    from app import video
+
+    class FakeProc:
+        def __init__(self, chunks):
+            self.chunks = list(chunks) + [b""]
+            self.returncode = 0
+            self.stdout = self
+            self.stderr = self
+
+        async def read(self, n=None):
+            await asyncio.sleep(0)
+            return self.chunks.pop(0) if self.chunks else b""
+
+        def kill(self):
+            pass
+
+        async def wait(self):
+            pass
+
+    spawned = []
+
+    async def fake_spawn(w, h):
+        spawned.append(time.monotonic())
+        return FakeProc([b"\x00\x00\x00\x01\x67a", b"\x00\x00\x00\x01\x65b"])
+
+    monkeypatch.setattr(video, "_spawn", fake_spawn)
+    monkeypatch.setattr(video, "should_prestart", lambda elapsed, **kw: len(spawned) < 2)  # prestart immediately
+    gen = video.h264_stream(1080, 1920)
+    got = []
+    async for nal in gen:
+        got.append(nal)
+        if len(got) >= 2 and None in got:
+            break
+    await gen.aclose()
+    assert len(spawned) == 2          # the replacement was started before the first one's EOF
+    assert None in got                # still signals a reset (new SPS/PPS) even though there was no gap
+
+
+def test_download_concurrency_setting():
+    from app import config
+    assert config.DOWNLOAD_CONCURRENCY >= 1
+
+
+def test_batch_install_downloads_overlap_with_install(client, monkeypatch):
+    """3 items: downloads must run concurrently (not one full download before the next starts)."""
+    from app.providers import PROVIDERS, Provider, Resolved
+    order = []
+
+    class SlowProvider(Provider):
+        name = "slowtest"
+
+        async def search(self, client, q):
+            return []
+
+        async def resolve(self, client, app_id):
+            order.append(f"resolve-{app_id}")
+            return Resolved(url=f"https://example.invalid/{app_id}.apk", package=f"com.x.{app_id}")
+
+    PROVIDERS["slowtest"] = SlowProvider()
+    try:
+        starts = []
+
+        async def fake_download(url, dest, cb):
+            starts.append(time.monotonic())
+            await asyncio.sleep(0.2)
+            dest.write_bytes(make_apk())
+
+        monkeypatch.setattr(main, "download", fake_download)
+        r = client.post("/api/install", json={"items": [{"provider": "slowtest", "id": n} for n in ("a", "b", "c")],
+                                              "run_last": False})
+        job = wait_job(client, r.json()["job"], timeout=10)
+        assert job["status"] == "done" and len(job["results"]) == 3
+        # all three downloads started within a short window of each other (concurrent), not 0.2s apart (serial)
+        assert max(starts) - min(starts) < 0.15
+    finally:
+        PROVIDERS.pop("slowtest", None)

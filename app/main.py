@@ -175,7 +175,7 @@ async def download(url: str, dest: Path, on_progress=None) -> None:
                 total = int(r.headers.get("content-length") or 0)
                 size = 0
                 with dest.open("wb") as f:
-                    async for chunk in r.aiter_bytes(1 << 16):
+                    async for chunk in r.aiter_bytes(1 << 20):
                         size += len(chunk)
                         if size > MAX_BYTES:
                             raise ValueError(f"file exceeds {config.MAX_APK_MB} MB")
@@ -337,33 +337,51 @@ async def job_cancel(job_id: str):
 
 
 def _install_job(items: list[Item], run_last: bool, allow_unsafe: bool):
+    """Resolve + download every item concurrently (bounded), overlapping that network time with the
+    previous item's install; installs themselves stay strictly one-at-a-time (the device is serial)."""
     async def work(job):
         await ensure_ready(job)
         n = len(items)
-        for i, item in enumerate(items):
-            base = i / n
-            span = 1 / n
-            label = item.id
-            try:
-                prov = PROVIDERS.get(item.provider)
-                if not prov:
-                    raise ValueError("unknown provider")
-                job.message = f"Resolving {label}…"
-                async with httpx.AsyncClient(headers={"User-Agent": "apk-loader/1.0"}, timeout=30) as c:
-                    meta = await prov.resolve(c, item.id)
-                dest = scratch_dir() / safe_filename((meta.package or item.id.rsplit("/", 1)[-1]) + meta.ext)
-                job.message = f"Downloading {label}…"
+        sem = asyncio.Semaphore(min(config.DOWNLOAD_CONCURRENCY, n) or 1)
+        fetched: dict[int, dict] = {}
 
-                def prog(f, base=base, span=span):
-                    job.progress = base + span * 0.6 * f
-                await download(meta.url, dest, prog)
-                job.progress = base + span * 0.7
-                job.message = f"Checking and installing {label}…"
-                res = await installer.verify_and_install(dest, meta, allow_unsafe, item.provider, item.id, label)
-                job.results.append({"label": label, **res})
-            except Exception as e:
-                _fail(job, label, e)
-            job.progress = (i + 1) / n
+        async def fetch(i: int, item: Item):
+            label = item.id
+            async with sem:
+                try:
+                    prov = PROVIDERS.get(item.provider)
+                    if not prov:
+                        raise ValueError("unknown provider")
+                    job.message = f"Resolving {label}…"
+                    async with httpx.AsyncClient(headers={"User-Agent": "apk-loader/1.0"}, timeout=30) as c:
+                        meta = await prov.resolve(c, item.id)
+                    dest = scratch_dir() / safe_filename((meta.package or item.id.rsplit("/", 1)[-1]) + meta.ext)
+                    job.message = f"Downloading {label}…"
+                    await download(meta.url, dest, lambda f: None)
+                    fetched[i] = {"ok": True, "meta": meta, "dest": dest}
+                except Exception as e:
+                    fetched[i] = {"ok": False, "error": e}
+
+        fetch_tasks = [asyncio.create_task(fetch(i, item)) for i, item in enumerate(items)]
+        try:
+            for i, item in enumerate(items):
+                label = item.id
+                job.progress = i / n
+                try:
+                    await fetch_tasks[i]       # already running/done from the pool above; just waits its turn
+                    r = fetched.pop(i)
+                    if not r["ok"]:
+                        raise r["error"]
+                    job.message = f"Checking and installing {label}…"
+                    res = await installer.verify_and_install(r["dest"], r["meta"], allow_unsafe,
+                                                              item.provider, item.id, label)
+                    job.results.append({"label": label, **res})
+                except Exception as e:
+                    _fail(job, label, e)
+                job.progress = (i + 1) / n
+        finally:
+            for t in fetch_tasks:
+                t.cancel()
         await _launch_last(job, run_last)
         job.message = ""
     return work
@@ -397,7 +415,7 @@ async def upload(files: list[UploadFile] = File(...), split: bool = Form(False),
         dest = d / f"{i}_{safe_filename(name)}"
         size = 0
         with dest.open("wb") as out:
-            while chunk := await f.read(1 << 16):
+            while chunk := await f.read(1 << 20):
                 size += len(chunk)
                 if size > MAX_BYTES:
                     shutil.rmtree(d, ignore_errors=True)
